@@ -1,0 +1,12 @@
+{
+  "name": "da_orbit",
+  "version": "1.0.0",
+  "description": "Granular-, Micro-Loop-, Glitch- und Multidelay-Effekt mit Looper im Browser (Web Audio / AudioWorklet)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs 8080",
+    "test": "node tests/dsp-test.mjs",
+    "test:browser": "node tests/browser-test.mjs"
+  }
+}

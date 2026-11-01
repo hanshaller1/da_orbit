@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>da_orbit Granular-Looper</title>
+  <meta name="description" content="Granular-, Micro-Loop-, Glitch- und Multidelay-Effekt mit Looper im Browser – funktional angelehnt an den Hologram Electronics Microcosm.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23ffb02e' stroke-width='3'/%3E%3Ccircle cx='16' cy='3' r='3' fill='%23ff5fa2'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%232ee6c5'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="12.5" fill="none" stroke="currentColor" stroke-width="2.5"/><circle cx="16" cy="3.5" r="3" class="brand-dot"/><circle cx="16" cy="16" r="3.5" class="brand-core"/></svg>
+      <div>
+        <div class="brand-name">da_orbit</div>
+        <div class="brand-sub">Granular · Loop · Glitch · Delay</div>
+      </div>
+    </div>
+    <div class="io">
+      <label class="io-item">
+        <span class="io-label">Quelle</span>
+        <select id="sourceSel" aria-label="Eingangsquelle">
+          <option value="demo:plucks">Demo: Zupf-Arpeggio</option>
+          <option value="demo:keys">Demo: E-Piano</option>
+          <option value="demo:beat">Demo: Beat</option>
+          <option value="input">Audio-Eingang</option>
+          <option value="file">Audiodatei …</option>
+          <option value="none">Kein Eingang</option>
+        </select>
+      </label>
+      <label class="io-item">
+        <span class="io-label">Eingang</span>
+        <input type="range" id="inGain" min="0" max="2" step="0.01" value="1" aria-label="Eingangspegel">
+        <span class="meter" aria-hidden="true"><span id="meterIn"></span></span>
+      </label>
+      <label class="io-item">
+        <span class="io-label">Ausgang</span>
+        <input type="range" id="outGain" min="0" max="1.2" step="0.01" value="0.8" aria-label="Ausgangslautstärke">
+        <span class="meter stereo" aria-hidden="true"><span id="meterL"></span><span id="meterR"></span></span>
+      </label>
+    </div>
+    <div class="top-actions">
+      <button type="button" class="tbtn" id="recBtn" title="Ausgang aufnehmen"><span class="rec-dot"></span><span>Aufnahme</span></button>
+      <button type="button" class="tbtn" id="midiBtn" title="MIDI aktivieren"><span class="midi-led"></span><span>MIDI</span></button>
+      <button type="button" class="tbtn icon" id="themeBtn" title="Farbschema wechseln" aria-label="Farbschema wechseln"><svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 2.5a7.5 7.5 0 0 1 0 15z" fill="currentColor"/></svg></button>
+      <button type="button" class="tbtn icon" id="settingsBtn" title="Einstellungen" aria-label="Einstellungen">⚙</button>
+      <button type="button" class="tbtn icon" id="helpBtn" title="Anleitung" aria-label="Anleitung">?</button>
+    </div>
+  </header>
+
+  <main class="deck">
+    <section class="panel inbar" id="inputBar" hidden aria-label="Audio-Eingang">
+      <div class="inbar-row">
+        <span class="inbar-title"><span class="in-led" id="inLed" aria-hidden="true"></span>Audio-Eingang</span>
+        <label class="inbar-field inbar-dev"><span class="io-label">Gerät</span><select id="inDevice" aria-label="Eingangsgerät"></select></label>
+        <label class="inbar-field"><span class="io-label">Kanäle</span><select id="inRoute" aria-label="Eingangskanäle"></select></label>
+        <label class="inbar-field"><span class="io-label">Verarbeitung</span><select id="inMode" data-g="mono" aria-label="Stereo oder Mono"><option value="0">Stereo</option><option value="1">Mono-Summe</option></select></label>
+        <button type="button" class="tbtn icon" id="inRefresh" title="Geräteliste neu einlesen" aria-label="Geräteliste neu einlesen">↻</button>
+        <span class="inbar-info" id="inInfo"></span>
+      </div>
+      <p class="inbar-hint" id="inHint" hidden></p>
+    </section>
+    <section class="pedal" aria-label="Effektgerät">
+      <div class="pedal-grid">
+        <div class="panel sel-panel">
+          <div id="selectorHost"></div>
+          <div class="fx-info">
+            <div class="fx-title"><span id="fxName">MOSAIC</span> <span class="fx-var" id="fxVar">A</span></div>
+            <div class="fx-varname" id="fxVarName"></div>
+            <p class="fx-desc" id="fxDesc"></p>
+            <dl class="fx-macros">
+              <dt>Aktivität</dt><dd id="fxAct"></dd>
+              <dt>Wiederholung</dt><dd id="fxRep"></dd>
+              <dt class="fx-shape-dt" hidden>Form</dt><dd id="fxShape" hidden></dd>
+            </dl>
+          </div>
+        </div>
+
+        <div class="panel viz-panel">
+          <canvas id="viz" aria-label="Visualisierung des Verlaufspuffers, der Stimmen und des Loopers"></canvas>
+          <div class="chips">
+            <span class="chip" id="voiceChip">0 Stimmen</span>
+            <span class="chip chip-hold" id="holdChip" hidden>HOLD</span>
+            <span class="chip chip-clock" id="clockChip" hidden>MIDI-Clock</span>
+            <span class="chip chip-byp" id="bypChip" hidden>BYPASS</span>
+          </div>
+        </div>
+
+        <div class="panel knob-panel">
+          <div class="knob-grid" id="knobHost"></div>
+          <div class="btn-row">
+            <button type="button" class="pbtn" id="shiftBtn" title="Shift-Funktionen (Umschalttaste halten)"><span class="led"></span>Shift</button>
+            <button type="button" class="pbtn" id="timeModeBtn" title="Zeit-Regler: Teilung oder Tempo (T)"><span class="led"></span><span id="timeModeText">Teilung</span></button>
+            <button type="button" class="pbtn" id="looperBtn" title="Phrase-Looper (L)"><span class="led"></span>Looper</button>
+            <button type="button" class="pbtn" id="loopRevBtn" title="Loop rückwärts (R)"><span class="led"></span>Loop ⟲</button>
+          </div>
+          <div class="readout" aria-live="off">
+            <div class="ro-cell"><span class="ro-label">Tempo</span><span class="ro-val"><span class="led" id="beatLed"></span><span id="bpmText">100 BPM</span></span></div>
+            <div class="ro-cell"><span class="ro-label">Teilung</span><span class="ro-val" id="subdivChip">TAP</span></div>
+            <div class="ro-cell"><span class="ro-label">Einheit</span><span class="ro-val" id="unitText">0.60 s</span></div>
+            <div class="ro-cell"><span class="ro-label">Hold</span><span class="ro-val" id="holdText">aus</span></div>
+            <div class="ro-cell"><span class="ro-label">Looper</span><span class="ro-val" id="loopMini">leer</span></div>
+            <div class="ro-cell"><span class="ro-label">Eingang</span><span class="ro-val" id="srcText">–</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="footswitches">
+        <div class="fs-wrap">
+          <button type="button" class="footswitch" id="fsLeft"><span class="fs-led" id="fsLeftLed"></span></button>
+          <div class="fs-label" id="fsLeftLabel">TAP</div>
+          <div class="fs-sub" id="fsLeftSub">Tempo tippen · Q</div>
+        </div>
+        <div class="fs-wrap">
+          <button type="button" class="footswitch" id="fsMid"><span class="fs-led" id="fsMidLed"></span></button>
+          <div class="fs-label">BYPASS</div>
+          <div class="fs-sub" id="fsMidSub">ein/aus · W</div>
+        </div>
+        <div class="fs-wrap">
+          <button type="button" class="footswitch" id="fsRight"><span class="fs-led" id="fsRightLed"></span></button>
+          <div class="fs-label" id="fsRightLabel">HOLD</div>
+          <div class="fs-sub" id="fsRightSub">Einfrieren · E</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="lower">
+      <div class="panel looper-panel">
+        <h2>Phrase-Looper</h2>
+        <div class="loop-status">
+          <span class="loop-state" id="loopState">leer</span>
+          <span class="loop-time" id="loopTime">0.0 / 0.0 s</span>
+        </div>
+        <div class="loop-bar"><span id="loopBar"></span></div>
+        <div class="toggles">
+          <label class="tgl"><input type="checkbox" id="optPre"><span>Vor den Effekten (Pre-FX)</span></label>
+          <label class="tgl"><input type="checkbox" id="optQuant"><span>Quantisieren (auf Schläge)</span></label>
+          <label class="tgl"><input type="checkbox" id="optOnly"><span>Nur Looper (Effekte stumm)</span></label>
+          <label class="tgl"><input type="checkbox" id="optBurst"><span>Burst (nur solange gedrückt)</span></label>
+        </div>
+        <div class="row-btns">
+          <button type="button" class="sbtn" id="loopUndoBtn">Overdub rückgängig</button>
+          <button type="button" class="sbtn" id="loopExportBtn">Loop als WAV</button>
+          <label class="sbtn file-btn">Loop laden<input type="file" id="loopImport" accept="audio/*"></label>
+        </div>
+        <p class="hint">Looper einschalten, dann linker Schalter: Aufnahme → Wiedergabe → Overdub. Lang drücken: Overdub rückgängig/wiederherstellen. Rechter Schalter: Stopp, lang: Löschen. Loop-Tempo über Shift + Zeit.</p>
+      </div>
+
+      <div class="panel preset-panel">
+        <h2>Presets</h2>
+        <div class="banks" id="bankHost"></div>
+        <div class="row-btns">
+          <button type="button" class="sbtn" id="saveModeBtn">Speichern …</button>
+          <button type="button" class="sbtn" id="suggBtn" title="Vorschlagswerte für den aktuellen Effekt laden">Vorschlag laden</button>
+          <button type="button" class="sbtn" id="exportBtn">Export</button>
+          <label class="sbtn file-btn">Import<input type="file" id="importFile" accept="application/json,.json"></label>
+        </div>
+        <p class="hint" id="presetHint">Klick lädt ein Preset. Zum Speichern „Speichern …“ wählen und einen Platz anklicken (oder Shift + Klick). Presets enthalten Reglerstellungen und den aktuellen Loop.</p>
+      </div>
+
+      <div class="panel keys-panel">
+        <h2>Tastatur</h2>
+        <ul class="keys">
+          <li><kbd>Q</kbd> linker Schalter (Tap / Rec·Play·Dub)</li>
+          <li><kbd>W</kbd> Bypass</li>
+          <li><kbd>E</kbd> rechter Schalter (Hold / Stopp·Löschen)</li>
+          <li><kbd>L</kbd> Looper · <kbd>R</kbd> Loop rückwärts</li>
+          <li><kbd>V</kbd> Effekt rückwärts · <kbd>T</kbd> Zeit-Modus</li>
+          <li><kbd>←</kbd><kbd>→</kbd> Variante · <kbd>↑</kbd><kbd>↓</kbd> Effekt</li>
+          <li><kbd>1</kbd>–<kbd>4</kbd> Variante A–D</li>
+          <li><kbd>⇧</kbd> halten: Shift-Funktionen</li>
+        </ul>
+        <p class="hint">Regler: ziehen, Mausrad oder Pfeiltasten. Doppelklick setzt zurück. Alt beim Ziehen = fein.</p>
+      </div>
+    </section>
+  </main>
+
+  <div class="overlay" id="startOverlay">
+    <div class="start-card">
+      <svg class="start-mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="12.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="16" cy="3.5" r="3" class="brand-dot"/><circle cx="16" cy="16" r="3.5" class="brand-core"/></svg>
+      <h1>da_orbit</h1>
+      <p>Ein Granular-, Micro-Loop-, Glitch- und Multidelay-Effekt mit Hold-Sampler und 60-Sekunden-Looper, komplett im Browser. Funktional angelehnt an den Microcosm von Hologram Electronics.</p>
+      <div class="start-btns">
+        <button type="button" class="big-btn primary" data-start="demo:plucks">Mit Demo-Klang starten</button>
+        <button type="button" class="big-btn" data-start="input">Audio-Interface / Mikrofon</button>
+        <label class="big-btn">Audiodatei wählen<input type="file" id="startFile" accept="audio/*"></label>
+      </div>
+      <p class="warn">Interfaces, USB-Geräte wie Syntakt oder Digitakt und Mikrofone lassen sich direkt wählen. Beim Mikrofon bitte Kopfhörer benutzen, sonst koppelt der Lautsprecher zurück.</p>
+      <p class="start-error" id="startError" hidden></p>
+    </div>
+  </div>
+
+  <dialog id="settingsDlg" class="dlg">
+    <form method="dialog">
+      <h2>Globale Einstellungen</h2>
+      <div class="set-grid">
+        <label>Eingangsmodus<select data-g="mono"><option value="1">Mono</option><option value="0">Stereo</option></select></label>
+        <label>Eingangspegel<select data-g="inputLine"><option value="0">Instrument (+4 dB)</option><option value="1">Line</option></select></label>
+        <label>Hold-Schalter<select data-g="holdMode"><option value="0">Umschalten</option><option value="1">Momentan (halten)</option></select></label>
+        <label>Bypass-Art<select data-g="bypassStyle"><option value="0">Gepuffert, ohne Trails</option><option value="1">Gepuffert, mit Trails</option><option value="2">True Bypass (hart)</option></select></label>
+        <label>Looper-Reihenfolge<select data-g="looperOrder"><option value="0">Rec → Play → Dub</option><option value="1">Rec → Dub → Play</option></select></label>
+        <label>Looper-Fade<select data-g="fadeShape"><option value="0">Ein- und Ausblenden</option><option value="1">Nur Einblenden</option><option value="2">Nur Ausblenden</option><option value="3">Kein Fade</option></select></label>
+        <label>Effektwechsel<select data-g="suggest"><option value="1">Vorschlagswerte laden</option><option value="0">Regler beibehalten (wie Hardware)</option></select></label>
+        <label>MIDI-Kanal<select data-g="midiChannel" id="midiChSel"></select></label>
+        <label>MIDI-Clock<select data-g="midiClock"><option value="1">Folgen</option><option value="0">Ignorieren</option></select></label>
+        <label>Expression (MIDI-CC)<input type="number" min="1" max="127" data-g="expCC"></label>
+        <label>Expression-Ziel<select data-g="expTarget">
+          <option value="activity">Aktivität</option><option value="repeats">Wiederholung</option><option value="shape">Form</option>
+          <option value="filter">Filter</option><option value="mix">Mix</option><option value="space">Raum</option><option value="loopLevel">Loop-Pegel</option>
+        </select></label>
+      </div>
+      <div class="dlg-actions">
+        <button type="button" class="sbtn" id="panicBtn">Puffer leeren (Panik)</button>
+        <button type="button" class="sbtn" id="resetGlobalBtn">Globale Einstellungen zurücksetzen</button>
+        <button value="close" class="sbtn primary">Schließen</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="helpDlg" class="dlg dlg-wide">
+    <form method="dialog">
+      <h2>Anleitung</h2>
+      <div class="help">
+        <h3>Signalfluss</h3>
+        <p>Der Eingang landet laufend in einem 40-Sekunden-Verlaufspuffer. Die Effekte spielen daraus Loops, Grains und Delay-Taps ab. Danach folgen Pitch-Modulation, ein resonanter Tiefpass, der Dry/Wet-Mix, der Looper (Post-FX, optional Pre-FX) und zuletzt der Raum (Hall plus Ping-Pong-Delay).</p>
+        <h3>Regler (Shift-Funktion in Klammern)</h3>
+        <table>
+          <tr><th>Aktivität</th><td>Makro für Dichte bzw. Komplexität, je Effekt unterschiedlich (Shift: Hallzeit)</td></tr>
+          <tr><th>Wiederholung</th><td>Dauer oder Häufigkeit, z. B. Ausklingen, Feedback, Glitch-Rate (Shift: Mod-Tiefe)</td></tr>
+          <tr><th>Form</th><td>Hüllkurve der Loops und Grains: rückwärts → schwellend → weich → Gate → perkussiv. Bei GLIDE die Glide-Kurve, bei PATTERN/WARP die Lautstärke über die Taps (Shift: Mod-Rate)</td></tr>
+          <tr><th>Zeit</th><td>Teilung ¼× ½× TAP 2× 4× 8× relativ zum Tempo, im Tempo-Modus direkt 40–240 BPM (Shift: Loop-Tempo ¼×–4×)</td></tr>
+          <tr><th>Filter</th><td>Tiefpass am Ende der Effektkette. Ganz rechts offen, ganz links ist der Effekt stumm (Shift: Resonanz)</td></tr>
+          <tr><th>Mix</th><td>Dry/Wet, in der Mitte beide voll (Shift: Effektlautstärke)</td></tr>
+          <tr><th>Raum</th><td>Hall + Delay, ganz rechts 100 % nass (Shift: Hall-Typ: heller Raum, dunkel mittel, große Halle, Ambient)</td></tr>
+          <tr><th>Loop-Pegel</th><td>Lautstärke des Loopers (Shift: Fade-Zeit beim Starten/Stoppen)</td></tr>
+        </table>
+        <h3>Fußschalter</h3>
+        <p><b>Links:</b> Tap-Tempo, im Looper-Modus Aufnahme/Wiedergabe/Overdub (lang: Overdub rückgängig). <b>Mitte:</b> Bypass. <b>Rechts:</b> Hold friert das zuletzt Gespielte in der eingestellten Teilung ein und füttert es weiter in den Effekt; im Looper-Modus Stopp (lang: Löschen). Hold ist nicht verfügbar, solange ein Loop existiert.</p>
+        <h3>Effekte</h3>
+        <div id="helpEffects"></div>
+        <h3>Audio-Eingänge</h3>
+        <p>Quelle <b>Audio-Eingang</b> wählen. Darunter erscheint die Eingangsleiste: <b>Gerät</b> (Audio-Interface, USB-Gerät wie Syntakt oder Digitakt, Mikrofon), <b>Kanäle</b> (Stereo-Paar wie 1+2 oder ein einzelner Mono-Kanal) und <b>Verarbeitung</b> (Stereo oder Mono-Summe). da_orbit merkt sich Gerät und Kanalwahl und verbindet ein wieder eingestecktes Gerät automatisch. Wie viele Kanäle eines Interfaces ankommen, entscheiden Browser und Treiber; oft sind es nur die ersten zwei.</p>
+        <h3>MIDI</h3>
+        <p>Programmwechsel 1–44 wählen die Effekte in der Reihenfolge ARP, INTERRUPT, BLOCKS, GLIDE, SEQ, MOSAIC, HAZE, TUNNEL, STRUM, PATTERN, WARP (je A–D), 45–60 die User-Presets. Eingehende MIDI-Clock setzt das Tempo, auch ohne Start-Befehl (z. B. Syntakt mit „Clock Send“); Start setzt den Takt auf die Eins. Wichtige CCs: 5 Teilung, 6 Aktivität, 7 Form, 8 Filter, 9 Mix, 10 Zeit, 11 Wiederholung, 12 Raum, 13 Loop-Pegel, 14 Mod-Rate, 15 Resonanz, 16 Effekt-Vol, 17 Loop-Tempo, 19 Mod-Tiefe, 20 Hallzeit, 21 Fade-Zeit, 22 Looper an/aus, 23 Loop-Richtung, 24 Routing, 25 Nur Looper, 26 Burst, 27 Quantisieren, 28–31/34/35 Rec, Play, Dub, Stopp, Löschen, Undo, 47 Effekt rückwärts, 48 Hold, 93 Tap, 102 Bypass.</p>
+        <p class="hint">da_orbit ist ein unabhängiges Projekt und steht in keiner Verbindung zu Hologram Electronics. Es nutzt keine Original-Firmware; alle Algorithmen sind Neuinterpretationen nach öffentlich beschriebener Funktionsweise.</p>
+      </div>
+      <div class="dlg-actions"><button value="close" class="sbtn primary">Schließen</button></div>
+    </form>
+  </dialog>
+
+  <input type="file" id="sourceFile" accept="audio/*" hidden>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
