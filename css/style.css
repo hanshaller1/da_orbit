@@ -226,7 +226,7 @@ input[type=range] { width: 90px; accent-color: var(--fx); }
 .ro-val.v-dub { color: var(--led-yellow); }
 
 /* Fußschalter */
-.footswitches { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 18px; position: relative; }
+.footswitches { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 44px; position: relative; }
 .fs-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
 .footswitch {
   position: relative; width: 84px; height: 84px; border-radius: 50%; cursor: pointer; touch-action: none;
