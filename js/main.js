@@ -38,26 +38,50 @@ function persist() {
   saveTimer = setTimeout(() => saveCurrent({ params, looperOpts }), 400);
 }
 function sendParams(values) { engine.setParams(values); persist(); }
-function download(blob, name) {
+async function download(blob, name) {
+  // In einer eingebetteten Ansicht (claude.ai-Artifact) laufen Downloads über die downloads-Fähigkeit
+  const cl = window.claude;
+  if (cl && typeof cl.use === 'function') {
+    let dl = null;
+    try { dl = await cl.use('downloads'); } catch (_) { dl = null; }
+    if (dl) {
+      try { await dl.save({ filename: name, data: blob }); return true; } catch (err) {
+        const code = err && err.code;
+        if (code === 'declined') return false;
+        toast(code === 'rejected_extension' ? 'Dieses Format lässt sich hier nicht speichern (lokale Version nutzen)' : 'Speichern ist hier nicht möglich');
+        return false;
+      }
+    }
+  }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  return true;
 }
 function stamp() { const d = new Date(); return d.toISOString().slice(0, 19).replace(/[:T]/g, '-'); }
 
 /* ---------------- Farbschema ---------------- */
 const THEME_KEY = 'da_orbit.theme';
+const rootEl = document.documentElement;
+const hostTheme = rootEl.dataset.theme || null; // von einer einbettenden Seite gesetzt
+const darkMq = window.matchMedia('(prefers-color-scheme: dark)');
+function resolveScheme() {
+  const t = rootEl.dataset.theme;
+  const dark = t === 'dark' || (t !== 'light' && darkMq.matches);
+  rootEl.dataset.scheme = dark ? 'dark' : 'light';
+}
 function applyTheme(mode) {
-  const root = document.documentElement;
-  if (mode === 'light' || mode === 'dark') root.dataset.theme = mode; else delete root.dataset.theme;
-  const dark = mode === 'dark' || (mode !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-  root.dataset.scheme = dark ? 'dark' : 'light';
+  if (mode === 'light' || mode === 'dark') rootEl.dataset.theme = mode;
+  else if (hostTheme) rootEl.dataset.theme = hostTheme;
+  else delete rootEl.dataset.theme;
+  resolveScheme();
 }
 let themeMode = 'auto';
 try { themeMode = localStorage.getItem(THEME_KEY) || 'auto'; } catch (_) { /* kein Speicher */ }
 applyTheme(themeMode);
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => applyTheme(themeMode));
+darkMq.addEventListener?.('change', resolveScheme);
+new MutationObserver(resolveScheme).observe(rootEl, { attributes: true, attributeFilter: ['data-theme'] });
 $('themeBtn').addEventListener('click', () => {
   themeMode = themeMode === 'auto' ? 'dark' : themeMode === 'dark' ? 'light' : 'auto';
   try { localStorage.setItem(THEME_KEY, themeMode); } catch (_) { /* kein Speicher */ }
@@ -269,7 +293,7 @@ $('loopUndoBtn').addEventListener('click', () => engine.post({ type: 'looper', c
 $('loopExportBtn').addEventListener('click', async () => {
   const d = await engine.getLoop();
   if (!d || !d.L) { toast('Kein Loop vorhanden'); return; }
-  download(encodeWav(d.L, d.R, d.sr), `da_orbit-loop-${stamp()}.wav`);
+  await download(encodeWav(d.L, d.R, d.sr), `da_orbit-loop-${stamp()}.wav`);
 });
 $('loopImport').addEventListener('change', async (e) => {
   const f = e.target.files[0]; e.target.value = '';
@@ -599,7 +623,7 @@ $('sourceFile').addEventListener('change', async (e) => {
   try { await ensureStarted(); await engine.loadFile(f); await engine.useFile(); $('sourceSel').value = 'file'; updateSrcText(); toast(f.name + ' läuft in Schleife'); } catch (err) { toast('Datei konnte nicht gelesen werden'); }
 });
 function errorText(err) {
-  if (err && err.name === 'NotAllowedError') return 'Mikrofon-Zugriff wurde verweigert';
+  if (err && err.name === 'NotAllowedError') return 'Mikrofon-Zugriff wurde verweigert oder ist in dieser Ansicht gesperrt';
   if (err && err.name === 'NotFoundError') return 'Kein Audio-Eingang gefunden';
   return (err && err.message) || String(err);
 }
@@ -640,7 +664,7 @@ $('recBtn').addEventListener('click', async () => {
     engine.startRecording(); btn.classList.add('is-on'); toast('Aufnahme läuft');
   } else {
     const blob = await engine.stopRecording(); btn.classList.remove('is-on');
-    if (blob) { const ext = blob.type.includes('ogg') ? 'ogg' : blob.type.includes('mp4') ? 'm4a' : 'webm'; download(blob, `da_orbit-${stamp()}.${ext}`); toast('Aufnahme gespeichert'); }
+    if (blob) { const ext = blob.type.includes('ogg') ? 'ogg' : blob.type.includes('mp4') ? 'mp4' : 'webm'; if (await download(blob, `da_orbit-${stamp()}.${ext}`)) toast('Aufnahme gespeichert'); }
   }
 });
 

@@ -79,8 +79,9 @@ kbd {
 .topbar {
   display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
   padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
-  position: sticky; top: 0; z-index: 5;
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5;
 }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--panel); }
 .brand { display: flex; align-items: center; gap: 10px; margin-right: auto; }
 .brand-mark { width: 30px; height: 30px; color: var(--fx); transition: color .3s; }
 .brand-dot { fill: var(--cat-glitch); }

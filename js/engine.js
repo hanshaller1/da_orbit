@@ -74,6 +74,9 @@ export class Engine extends EventTarget {
 
   async useMic(deviceId) {
     await this.init();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Mikrofon ist hier nicht verfügbar (benötigt HTTPS oder localhost)');
+    }
     this.stopSource();
     const constraints = {
       audio: {
