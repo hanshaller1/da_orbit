@@ -16,14 +16,18 @@ export class Midi {
     attach();
   }
   onMessage(d, ts) {
+    if (!d || !d.length) return;
     const st = d[0];
     if (st === 0xf8) return this.onClock(ts);
     if (st === 0xfa || st === 0xfb) { this.clockRunning = true; this.h.clockStart && this.h.clockStart(); return; }
     if (st === 0xfc) { this.clockRunning = false; this.h.clockStop && this.h.clockStop(); return; }
+    // übrige System-Nachrichten (Active Sensing 0xFE alle 300 ms, SysEx, Song Position …) ignorieren;
+    // früher ließen sie die Aktivitätsanzeige dauernd flackern und liefen durch den Kanalfilter
+    if (st >= 0xf0 || st < 0x80) return;
     const type = st & 0xf0, ch = (st & 0x0f) + 1;
     if (this.channel && ch !== this.channel) return;
-    if (type === 0xb0) this.h.cc && this.h.cc(d[1], d[2]);
-    else if (type === 0xc0) this.h.pc && this.h.pc(d[1]);
+    if (type === 0xb0 && d.length >= 3) this.h.cc && this.h.cc(d[1] & 0x7f, d[2] & 0x7f);
+    else if (type === 0xc0 && d.length >= 2) this.h.pc && this.h.pc(d[1] & 0x7f);
     this.h.activity && this.h.activity();
   }
   // Clock-Ticks werden auch ohne Start-Befehl ausgewertet (viele Geräte, z. B. Elektron, senden laufend Clock)

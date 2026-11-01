@@ -219,6 +219,89 @@ try {
   if (mc.options.join(' ') !== '0,1 2,3 0,0 1,1 2,2 3,3') fail('Kanaloptionen für 4 Kanäle falsch');
   if (mc['2,3'].join() !== '0.4,0.8' || mc['3,3'].join() !== '0.8,0.8' || mc['0,1'].join() !== '0.1,0.2') fail('Kanalrouting falsch');
 
+  // Quelle wechseln, während der Eingang noch angefragt wird: die spätere Wahl (Demo) muss gewinnen
+  const race = await page.evaluate(async () => {
+    const e = window.daOrbit.engine, sel = document.getElementById('sourceSel');
+    const orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = async (c) => { await new Promise((r) => setTimeout(r, 300)); return orig(c); };
+    sel.value = 'input'; sel.dispatchEvent(new Event('change'));
+    await new Promise((r) => setTimeout(r, 50));
+    sel.value = 'demo:beat'; sel.dispatchEvent(new Event('change'));
+    await new Promise((r) => setTimeout(r, 700));
+    navigator.mediaDevices.getUserMedia = orig;
+    return { kind: e.sourceKind, stream: !!e.mediaStream, sel: sel.value, bar: !document.getElementById('inputBar').hidden };
+  });
+  console.log('Quellenwechsel während der Freigabe:', JSON.stringify(race));
+  if (race.kind !== 'demo' || race.stream || race.sel !== 'demo:beat' || race.bar) fail('Verspätete Eingangsfreigabe überschreibt die gewählte Demo');
+
+  // Loop mit Preset speichern und wieder laden (Transfer in Stücken in beide Richtungen)
+  const loopRt = await page.evaluate(async () => {
+    const d = window.daOrbit, e = d.engine, wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    e.post({ type: 'looper', cmd: 'erase' });
+    e.post({ type: 'looper', cmd: 'rec' }); await wait(1500); e.post({ type: 'looper', cmd: 'play' }); await wait(300);
+    const a = await e.getLoop();
+    await d.savePreset(5);
+    e.post({ type: 'looper', cmd: 'erase' }); await wait(200);
+    await d.loadPreset(5); await wait(600);
+    const b = await e.getLoop();
+    let diff = 0; if (a && b) for (let i = 200; i < a.L.length - 200; i += 97) diff = Math.max(diff, Math.abs(a.L[i] - b.L[i]));
+    return { lenA: a && a.L.length, lenB: b && b.L.length, sr: e.ctx.sampleRate, diff, slot: d.store.get(5) && d.store.get(5).hasLoop };
+  });
+  console.log('Loop über Preset:', JSON.stringify(loopRt));
+  if (!loopRt.lenA || loopRt.lenA < loopRt.sr * 1.2) fail('Loop-Export liefert keinen vollständigen Loop');
+  if (loopRt.lenB !== loopRt.lenA || loopRt.diff > 1e-4 || !loopRt.slot) fail('Loop wird über Preset nicht korrekt gespeichert/geladen');
+
+  // Kaputte Preset-Datei importieren: keine Abstürze, Werte begrenzt
+  const imp = await page.evaluate(async () => {
+    const d = window.daOrbit;
+    const bad = { app: 'da_orbit', version: 1, presets: new Array(16).fill(null) };
+    bad.presets[0] = { name: 'Kaputt', params: { effect: 99, variation: -3, mix: 'x', filter: null, time: 7 }, looperOpts: { len: 1e9 } };
+    bad.presets[1] = { params: 'nix' };
+    bad.presets[2] = 42;
+    d.store.importJSON(JSON.stringify(bad));
+    await d.loadPreset(0);
+    await new Promise((r) => setTimeout(r, 300));
+    return { p: { ...d.params }, slots: [...document.querySelectorAll('.slot')].slice(0, 3).map((x) => x.textContent), out: window.__last && window.__last.peakL };
+  });
+  console.log('Import kaputter Presets:', JSON.stringify({ effect: imp.p.effect, variation: imp.p.variation, mix: imp.p.mix, time: imp.p.time, slots: imp.slots }));
+  if (imp.p.effect !== 10 || imp.p.variation !== 0 || !(imp.p.mix >= 0 && imp.p.mix <= 1) || imp.p.time !== 1) fail('Importierte Presets werden nicht geprüft');
+  if (!Number.isFinite(imp.out)) fail('Audio nach kaputtem Preset nicht mehr endlich');
+
+  // MIDI-CC 5 (Teilung) im Tempo-Modus darf das Tempo nicht verstellen
+  const cc5 = await page.evaluate(async () => {
+    const d = window.daOrbit, wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    if (d.params.timeMode !== 1) document.getElementById('timeModeBtn').click();
+    await wait(200);
+    const before = window.__last.bpm;
+    d.midi.onMessage(new Uint8Array([0xb0, 5, 1]), performance.now());
+    await wait(300);
+    // Active Sensing darf nicht als Aktivität zählen
+    d.midi.onMessage(new Uint8Array([0xfe]), performance.now());
+    const act = document.getElementById('midiBtn').classList.contains('is-act');
+    return { before, after: window.__last.bpm, timeMode: d.params.timeMode, act };
+  });
+  console.log('MIDI-CC 5 im Tempo-Modus:', JSON.stringify(cc5));
+  if (Math.abs(cc5.after - cc5.before) > 0.5 || cc5.timeMode !== 0) fail('CC 5 verstellt das Tempo');
+  if (cc5.act) fail('Active Sensing löst die MIDI-Aktivitätsanzeige aus');
+
+  // Momentanes Hold: Fenster verliert den Fokus, während E gehalten wird → Hold muss enden
+  await page.evaluate(() => {
+    window.daOrbit.engine.post({ type: 'looper', cmd: 'erase' }); // Hold geht nur ohne Loop
+    if (window.daOrbit.ui.looperMode) window.daOrbit.setLooperMode(false);
+    const el = document.querySelector('#settingsDlg [data-g="holdMode"]'); el.value = '1'; el.dispatchEvent(new Event('change'));
+    document.activeElement && document.activeElement.blur && document.activeElement.blur();
+  });
+  await page.waitForTimeout(200);
+  await page.keyboard.down('e');
+  await page.waitForTimeout(300);
+  const heldOn = await page.evaluate(() => window.daOrbit.ui.hold);
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  await page.waitForTimeout(300);
+  const heldAfter = await page.evaluate(() => ({ ui: window.daOrbit.ui.hold, dsp: window.__last.hold }));
+  await page.keyboard.up('e');
+  console.log('Momentanes Hold bei Fokusverlust:', heldOn, '→', JSON.stringify(heldAfter));
+  if (!heldOn || heldAfter.ui || heldAfter.dsp) fail('Gehaltene Taste bleibt nach Fokusverlust hängen');
+
   if (errors.length) { console.log('Konsolenfehler:', errors); fail('Konsolenfehler vorhanden'); }
 
   // Hell + Mobil

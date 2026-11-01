@@ -13,6 +13,8 @@ node server.mjs          # oder: npm start
 # dann http://localhost:8080 öffnen
 ```
 
+Der Server ist nur auf diesem Rechner erreichbar und liefert keine versteckten Dateien (`.git` usw.) aus. Für Tablet oder Handy im Heimnetz: `HOST=0.0.0.0 node server.mjs` (Audio-Eingänge gehen dort nur über HTTPS, Demos und Dateien schon).
+
 Alternativ: `python3 -m http.server 8080`. Getestet mit Chromium; Firefox und Safari unterstützen AudioWorklet ebenfalls.
 
 Beim Start wählst du eine Quelle: eingebaute Demo (Zupf-Arpeggio, E-Piano, Beat), einen Audio-Eingang (Interface, USB-Gerät, Mikrofon) oder eine Audiodatei (auch per Drag & Drop). Mit Mikrofon bitte Kopfhörer verwenden.
@@ -85,8 +87,10 @@ Tastatur: `Q` `W` `E` Fußschalter (halten = lang drücken), `L` Looper, `R` Loo
 ## Tests
 
 ```bash
-node tests/dsp-test.mjs       # alle 44 Algorithmen, Looper, Quantisierung, Hold, Bypass offline in Node
-node tests/browser-test.mjs   # Chromium via Playwright: UI, Effekte, Hold, Looper, Presets, Audio-Eingang mit Kanalwahl, Mobil-Layout
+node tests/dsp-test.mjs       # alle 44 Algorithmen, Looper, Quantisierung, Hold, Bypass offline in Node,
+                              # dazu Robustheit (ungültige Werte, NaN), Delay-Timing, Loop-Transfer und Knackser
+node tests/browser-test.mjs   # Chromium via Playwright: UI, Effekte, Hold, Looper, Presets, Audio-Eingang mit Kanalwahl,
+                              # Quellenwechsel während der Freigabe, kaputte Preset-Dateien, MIDI, Mobil-Layout
 ```
 
 ## Aufbau

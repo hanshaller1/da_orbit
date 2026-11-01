@@ -7,8 +7,9 @@ import { Visualizer } from './ui/visualizer.js';
 import { PresetStore, loadGlobal, saveGlobal, loadCurrent, saveCurrent } from './presets.js';
 import { Midi } from './midi.js';
 import {
-  EFFECTS, CATEGORIES, KNOBS, BANKS, DEFAULT_PARAMS, DEFAULT_GLOBAL, MIDI_CC, PC_ORDER,
+  EFFECTS, CATEGORIES, KNOBS, BANKS, DEFAULT_GLOBAL, MIDI_CC, PC_ORDER,
   SUBDIV_LONG, SUBDIV_LABELS, SUBDIV_SHORT, timeLabel, shapeLabel, glideShapeLabel,
+  sanitizeParams, sanitizeLooperOpts, sanitizeGlobal,
 } from './data.js';
 
 const $ = (id) => document.getElementById(id);
@@ -17,9 +18,9 @@ const store = new PresetStore();
 
 /* ---------------- Zustand ---------------- */
 const saved = loadCurrent();
-const params = { ...DEFAULT_PARAMS, ...(saved && saved.params) };
-const looperOpts = { pre: false, quant: false, only: false, burst: false, ...(saved && saved.looperOpts) };
-const global = loadGlobal(DEFAULT_GLOBAL);
+const params = sanitizeParams(saved && saved.params);
+const looperOpts = sanitizeLooperOpts(saved && saved.looperOpts);
+const global = loadGlobal();
 const ui = {
   shiftLatch: false, shiftKey: false, looperMode: false, hold: false, bypass: false,
   saveMode: false, currentSlot: -1, loopState: null, extClock: false, started: false,
@@ -217,6 +218,7 @@ function footswitch(btnId, handlers) {
   btn.addEventListener('pointerdown', (e) => { e.preventDefault(); btn.setPointerCapture(e.pointerId); press(); });
   btn.addEventListener('pointerup', release);
   btn.addEventListener('pointercancel', release);
+  btn.addEventListener('lostpointercapture', release);
   btn.addEventListener('keydown', (e) => { if ((e.key === 'Enter' || e.key === ' ') && !e.repeat) { e.preventDefault(); press(); } });
   btn.addEventListener('keyup', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); release(); } });
   return { press, release };
@@ -302,9 +304,10 @@ $('loopImport').addEventListener('change', async (e) => {
     await ensureStarted();
     const buf = await engine.ctx.decodeAudioData(await f.arrayBuffer());
     const L = buf.getChannelData(0), R = buf.numberOfChannels > 1 ? buf.getChannelData(1) : L;
-    engine.setLoop(L, R, buf.sampleRate);
+    if (!engine.setLoop(L, R, buf.sampleRate)) { toast('Datei ist zu kurz für einen Loop'); return; }
     setLooperMode(true);
-    toast(`Loop geladen (${buf.duration.toFixed(1)} s) – linker Schalter startet ihn`);
+    const sec = Math.min(60, buf.duration);
+    toast(`Loop geladen (${sec.toFixed(1)} s${buf.duration > 60 ? ', auf 60 s gekürzt' : ''}) – linker Schalter startet ihn`);
   } catch (err) { toast('Datei konnte nicht gelesen werden'); }
 });
 const LOOP_NAMES = ['leer', 'Aufnahme', 'Wiedergabe', 'Overdub', 'gestoppt'];
@@ -344,17 +347,20 @@ async function savePreset(idx) {
   const fx = EFFECTS[params.effect];
   const name = `${fx.name.slice(0, 5)} ${'ABCD'[params.variation]}`;
   const loop = engine.node ? await engine.getLoop() : null;
-  await store.save(idx, { name, params: { ...params }, looperOpts: { ...looperOpts } }, loop && loop.L ? loop : null);
+  const withLoop = !!(loop && loop.L);
+  const loopSaved = await store.save(idx, { name, params: { ...params }, looperOpts: { ...looperOpts } }, withLoop ? loop : null);
   ui.currentSlot = idx; ui.saveMode = false;
   $('saveModeBtn').classList.remove('is-on'); document.querySelector('.preset-panel').classList.remove('is-saving');
   renderSlots();
-  toast(`Gespeichert auf ${BANKS[idx >> 2].name} ${idx % 4 + 1}${loop && loop.L ? ' (mit Loop)' : ''}`);
+  const where = `${BANKS[idx >> 2].name} ${idx % 4 + 1}`;
+  if (withLoop && !loopSaved) toast(`Gespeichert auf ${where}, aber ohne Loop (Browser-Speicher voll oder gesperrt)`);
+  else toast(`Gespeichert auf ${where}${withLoop ? ' (mit Loop)' : ''}`);
 }
 async function loadPreset(idx) {
   const p = store.get(idx);
   if (!p) return;
-  Object.assign(params, DEFAULT_PARAMS, p.params);
-  Object.assign(looperOpts, p.looperOpts || {});
+  Object.assign(params, sanitizeParams(p.params));
+  Object.assign(looperOpts, sanitizeLooperOpts(p.looperOpts));
   for (const [id, key] of Object.entries(optMap)) $(id).checked = !!looperOpts[key];
   engine.setParams({ ...params });
   sendLooperOpts();
@@ -364,9 +370,7 @@ async function loadPreset(idx) {
   ui.currentSlot = idx; renderSlots(); persist();
   if (p.hasLoop) {
     const loop = await store.loadLoop(idx);
-    if (loop && loop.L) {
-      engine.post({ type: 'looper', cmd: 'erase' });
-      engine.setLoop(loop.L, loop.R, loop.sr);
+    if (loop && loop.L && engine.setLoop(loop.L, loop.R, loop.sr)) {
       setLooperMode(true);
       toast(`${p.name} geladen – Loop bereit (linker Schalter)`);
       return;
@@ -403,7 +407,8 @@ function syncSettingsForm() {
 document.querySelectorAll('[data-g]').forEach((el) => {
   el.addEventListener('change', () => {
     const k = el.dataset.g;
-    global[k] = el.type === 'number' || k !== 'expTarget' ? Number(el.value) : el.value;
+    // ungültige Eingaben (leeres Zahlenfeld, CC 0 …) fallen auf den bisherigen Wert zurück
+    Object.assign(global, sanitizeGlobal({ ...global, [k]: el.value }, global));
     saveGlobal(global); applyGlobal(); syncSettingsForm();
   });
 });
@@ -438,7 +443,13 @@ function setExtClock(on) {
 const midi = new Midi({
   cc: (cc, val) => handleCC(cc, val),
   pc: (p) => handlePC(p),
-  clockStart: () => { if (global.midiClock) { setExtClock(true); engine.post({ type: 'bpm', bpm: ui.bpm, resync: true }); } },
+  clockStart: () => {
+    if (!global.midiClock) return;
+    setExtClock(true);
+    // Start ohne folgende Clock-Ticks darf das Tap-Tempo nicht dauerhaft sperren
+    clearTimeout(clockWatch); clockWatch = setTimeout(() => setExtClock(false), 1500);
+    engine.post({ type: 'bpm', bpm: ui.bpm, resync: true });
+  },
   clockStop: () => { /* Clock-Ticks laufen bei vielen Geräten weiter; der Watchdog beendet den externen Takt */ },
   clockBpm: (bpm) => {
     if (!global.midiClock) return;
@@ -469,7 +480,14 @@ function handleCC(cc, val) {
   if (!m) return;
   switch (m.kind) {
     case 'param': setParamFromExternal(m.key, v); break;
-    case 'subdiv': params.timeMode = 0; setParamFromExternal('time', (Math.min(5, val) + 0.5) / 6); sendParams({ timeMode: 0 }); updateTimeDisplay(); break;
+    case 'subdiv': {
+      // timeMode und time in EINER Nachricht: einzeln interpretierte der Prozessor den neuen Zeitwert
+      // noch im Tempo-Modus und setzte das Tempo auf ~57 BPM
+      params.timeMode = 0; params.time = (Math.min(5, val) + 0.5) / 6;
+      sendParams({ timeMode: 0, time: params.time });
+      knobs.time.render(); updateTimeDisplay();
+      break;
+    }
     case 'loopSpeedStep': {
       const steps = [0.25, 0.5, 1, 2, 4];
       const s = steps[Math.min(4, Math.floor(v * 5))];
@@ -534,7 +552,14 @@ window.addEventListener('keyup', (e) => {
   held.delete(k);
   if (k === 'q') fsLeft.release(); else if (k === 'w') fsMid.release(); else if (k === 'e') fsRight.release();
 });
-window.addEventListener('blur', () => { ui.shiftKey = false; setShiftVisual(); });
+// Fenster verliert den Fokus, während Q/W/E gehalten wird: keyup kommt nie an → Schalter lösen
+// (sonst bliebe z. B. Burst-Aufnahme oder momentanes Hold hängen)
+function releaseHeldKeys() {
+  for (const k of held) { if (k === 'q') fsLeft.release(); else if (k === 'w') fsMid.release(); else if (k === 'e') fsRight.release(); }
+  held.clear();
+}
+window.addEventListener('blur', () => { ui.shiftKey = false; setShiftVisual(); releaseHeldKeys(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseHeldKeys(); });
 
 /* ---------------- Engine-Zustand → Oberfläche ---------------- */
 let lastBeat = -1, beatLedTimer = 0;
@@ -583,6 +608,17 @@ engine.addEventListener('state', (ev) => {
     $('fsLeftLed').className = 'fs-led ' + c + (lp.st === 1 && lp.rec > 55 ? ' blink' : '');
     $('fsRightLed').className = 'fs-led' + (lp.st === 4 ? ' c-red' : '');
   }
+});
+
+engine.addEventListener('recovered', (e) => {
+  toast(e.detail && e.detail.loopCleared ? 'Audiofehler abgefangen – Effekte und Loop zurückgesetzt' : 'Audiofehler abgefangen – Effekte zurückgesetzt');
+});
+engine.addEventListener('processorerror', () => toast('Der Audio-Prozessor ist abgestürzt – bitte die Seite neu laden'));
+engine.addEventListener('recordererror', async () => {
+  $('recBtn').classList.remove('is-on');
+  const blob = await engine.stopRecording(); // bisher Aufgenommenes nicht verlieren
+  toast('Aufnahme abgebrochen');
+  if (blob) saveRecording(blob);
 });
 
 /* ---------------- Audio-Eingang (Interface, USB-Gerät, Mikrofon) ---------------- */
@@ -681,7 +717,7 @@ $('inDevice').addEventListener('change', async (e) => {
     if (seq !== srcSeq) return;
     $('sourceSel').value = 'input'; ui.srcVal = 'input'; updateSrcText();
     toast(info.label + ' aktiv');
-  } catch (err) { toast(errorText(err)); updateInputBar(); }
+  } catch (err) { if (!isSuperseded(err)) toast(errorText(err)); updateInputBar(); }
 });
 $('inRoute').addEventListener('change', (e) => {
   const [a, b] = e.target.value.split(',').map(Number);
@@ -741,7 +777,13 @@ async function useSource(val) {
     if (seq !== srcSeq) return;
     toast(info.label + ' aktiv');
   } else if (val === 'file') {
-    if (engine.fileBuffer) { await engine.useFile(); toast(engine.fileName + ' läuft in Schleife'); } else $('sourceFile').click();
+    if (engine.fileBuffer) { await engine.useFile(); toast(engine.fileName + ' läuft in Schleife'); }
+    else {
+      // erst nach der Dateiauswahl umschalten; bis dahin (oder bei Abbruch) bleibt die bisherige Quelle
+      $('sourceSel').value = ui.srcVal || 'none';
+      $('sourceFile').click();
+      return;
+    }
   } else engine.useNone();
   if (seq !== srcSeq) return;
   $('sourceSel').value = val; ui.srcVal = val;
@@ -757,13 +799,17 @@ function updateSrcText() {
   updateInputBar();
 }
 $('sourceSel').addEventListener('change', async (e) => {
-  try { await useSource(e.target.value); } catch (err) { toast(errorText(err)); $('sourceSel').value = ui.srcVal || 'none'; updateSrcText(); }
+  try { await useSource(e.target.value); } catch (err) {
+    if (isSuperseded(err)) return; // inzwischen andere Quelle gewählt
+    toast(errorText(err)); $('sourceSel').value = ui.srcVal || 'none'; updateSrcText();
+  }
 });
 $('sourceFile').addEventListener('change', async (e) => {
   const f = e.target.files[0]; e.target.value = '';
   if (!f) return;
   try { await ensureStarted(); await engine.loadFile(f); await engine.useFile(); $('sourceSel').value = 'file'; ui.srcVal = 'file'; updateSrcText(); toast(f.name + ' läuft in Schleife'); } catch (err) { toast('Datei konnte nicht gelesen werden'); }
 });
+const isSuperseded = (err) => !!err && err.name === 'SupersededError';
 function errorText(err) {
   if (err && err.name === 'NotAllowedError') return 'Zugriff auf Audio-Eingänge wurde verweigert oder ist in dieser Ansicht gesperrt';
   if (err && err.name === 'NotFoundError') return 'Kein Audio-Eingang gefunden';
@@ -775,6 +821,7 @@ document.querySelectorAll('[data-start]').forEach((b) => b.addEventListener('cli
     await useSource(b.dataset.start);
     $('startOverlay').hidden = true;
   } catch (err) {
+    if (isSuperseded(err)) return;
     const el = $('startError'); el.hidden = false; el.textContent = errorText(err);
   }
 }));
@@ -802,14 +849,19 @@ $('outGain').addEventListener('input', (e) => engine.ctx && engine.setMaster(Num
 $('recBtn').addEventListener('click', async () => {
   const btn = $('recBtn');
   if (!engine.recorder) {
-    await ensureStarted();
-    if (!window.MediaRecorder) { toast('Aufnahme wird von diesem Browser nicht unterstützt'); return; }
-    engine.startRecording(); btn.classList.add('is-on'); toast('Aufnahme läuft');
+    try {
+      await ensureStarted();
+      engine.startRecording(); btn.classList.add('is-on'); toast('Aufnahme läuft');
+    } catch (err) { toast(err && err.message ? err.message : 'Aufnahme nicht möglich'); }
   } else {
     const blob = await engine.stopRecording(); btn.classList.remove('is-on');
-    if (blob) { const ext = blob.type.includes('ogg') ? 'ogg' : blob.type.includes('mp4') ? 'mp4' : 'webm'; if (await download(blob, `da_orbit-${stamp()}.${ext}`)) toast('Aufnahme gespeichert'); }
+    if (blob) saveRecording(blob);
   }
 });
+async function saveRecording(blob) {
+  const ext = blob.type.includes('ogg') ? 'ogg' : blob.type.includes('mp4') ? 'mp4' : 'webm';
+  if (await download(blob, `da_orbit-${stamp()}.${ext}`)) toast('Aufnahme gespeichert');
+}
 
 /* ---------------- Initialisierung ---------------- */
 selector.select(params.effect, params.variation, false);
@@ -818,4 +870,4 @@ updateTimeDisplay(); updateFxInfo(); renderSlots(); setShiftVisual(); updateFoot
 $('bpmText').textContent = Math.round(ui.bpm) + ' BPM';
 midi.channel = global.midiChannel | 0;
 // Für Tests und Konsolen-Experimente
-window.daOrbit = { engine, params, ui, selectEffect, setHold, setBypass, setLooperMode };
+window.daOrbit = { engine, params, ui, store, midi, selectEffect, setHold, setBypass, setLooperMode, savePreset, loadPreset };
