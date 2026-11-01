@@ -135,12 +135,89 @@ try {
   await page.screenshot({ path: path.join(outDir, '08-settings.png') });
   await page.keyboard.press('Escape');
 
-  // Mikrofon (Fake-Gerät)
-  await page.selectOption('#sourceSel', 'mic');
-  await page.waitForTimeout(800);
-  const kind = await page.evaluate(() => window.daOrbit.engine.sourceKind);
-  console.log('Quelle nach Mikrofon-Wahl:', kind);
-  if (kind !== 'mic') fail('Mikrofon-Eingang ließ sich nicht aktivieren');
+  // Audio-Eingang (Fake-Gerät von Chromium): Leiste, Geräte- und Kanalwahl, Pegel, Trennen/Wiederverbinden
+  await page.selectOption('#sourceSel', 'input');
+  await page.waitForTimeout(400);
+  await page.evaluate(() => { window.__maxIn = 0; window.daOrbit.engine.addEventListener('state', (e) => { window.__maxIn = Math.max(window.__maxIn, e.detail.peakIn); }); });
+  await page.waitForTimeout(1600);
+  const inp = await page.evaluate(() => {
+    const e = window.daOrbit.engine;
+    return {
+      kind: e.sourceKind, info: e.inputInfo, route: e.inputRoute, maxIn: window.__maxIn,
+      bar: !document.getElementById('inputBar').hidden,
+      devs: [...document.querySelectorAll('#inDevice option')].map((o) => o.text),
+      routes: [...document.querySelectorAll('#inRoute option')].map((o) => o.value),
+      info2: document.getElementById('inInfo').textContent,
+    };
+  });
+  console.log('Audio-Eingang:', inp.kind, inp.info && inp.info.label, '| Kanäle', inp.info && inp.info.channels, '| Route', inp.route, '| Pegel', inp.maxIn.toFixed(3));
+  console.log('  Geräte:', inp.devs.join(' / '), '| Kanaloptionen:', inp.routes.join(' '), '| Info:', inp.info2);
+  if (inp.kind !== 'input') fail('Audio-Eingang ließ sich nicht aktivieren');
+  if (!inp.bar) fail('Eingangsleiste wird nicht angezeigt');
+  if (!inp.devs.length) fail('Keine Geräte in der Liste');
+  if (!inp.routes.length) fail('Keine Kanaloptionen');
+  if (!(inp.maxIn > 0.001)) fail('Kein Eingangspegel vom Testgerät');
+  await page.screenshot({ path: path.join(outDir, '11-input.png') });
+  if (inp.routes.includes('1,1')) {
+    await page.selectOption('#inRoute', '1,1');
+    const r = await page.evaluate(() => window.daOrbit.engine.inputRoute);
+    if (r.a !== 1 || r.b !== 1) fail('Kanalwahl wird nicht übernommen');
+    const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('da_orbit.input.v1')));
+    console.log('  Gespeichert:', JSON.stringify(stored));
+    if (!stored || !stored.routes || !Object.values(stored.routes).some((x) => x.a === 1)) fail('Kanalwahl wird nicht gespeichert');
+  }
+  if (inp.devs.length > 1) {
+    const vals = await page.evaluate(() => [...document.querySelectorAll('#inDevice option')].map((o) => o.value));
+    const cur = await page.evaluate(() => window.daOrbit.engine.inputInfo.deviceId);
+    const other = vals.find((v) => v && v !== cur && v !== 'default');
+    if (other) {
+      await page.selectOption('#inDevice', other);
+      await page.waitForTimeout(800);
+      const now = await page.evaluate(() => window.daOrbit.engine.inputInfo && window.daOrbit.engine.inputInfo.deviceId);
+      console.log('  Gerätewechsel:', now === other ? 'ok' : now);
+      if (now !== other) fail('Gerätewechsel funktioniert nicht');
+    }
+  }
+  // Gerät „abziehen“ und wieder „anstecken“
+  await page.evaluate(() => window.daOrbit.engine.mediaStream.getAudioTracks()[0].dispatchEvent(new Event('ended')));
+  await page.waitForTimeout(200);
+  const lost = await page.evaluate(() => ({ kind: window.daOrbit.engine.sourceKind, bar: !document.getElementById('inputBar').hidden, lost: document.getElementById('inputBar').classList.contains('is-lost') }));
+  if (lost.kind !== 'none' || !lost.bar || !lost.lost) fail('Getrenntes Gerät wird nicht angezeigt ' + JSON.stringify(lost));
+  await page.evaluate(() => navigator.mediaDevices.dispatchEvent(new Event('devicechange')));
+  await page.waitForTimeout(1000);
+  const back = await page.evaluate(() => window.daOrbit.engine.sourceKind);
+  console.log('  Nach Trennen/Wiederverbinden:', back);
+  if (back !== 'input') fail('Gerät wird nicht automatisch wieder verbunden');
+  // zurück zur Demo: Leiste verschwindet
+  await page.selectOption('#sourceSel', 'demo:plucks');
+  await page.waitForTimeout(300);
+  if (await page.isVisible('#inputBar')) fail('Eingangsleiste bleibt bei Demo sichtbar');
+
+  // Mehrkanal-Routing: Gerät mit 4 Kanälen simulieren (Pegel 0.1/0.2/0.4/0.8 je Kanal)
+  const mc = await page.evaluate(async () => {
+    const e = window.daOrbit.engine, ctx = e.ctx;
+    const merger = ctx.createChannelMerger(4);
+    [0.1, 0.2, 0.4, 0.8].forEach((g, i) => { const o = ctx.createOscillator(); const a = ctx.createGain(); a.gain.value = g; o.connect(a); a.connect(merger, 0, i); o.start(); });
+    const dest = ctx.createMediaStreamDestination();
+    const tr = dest.stream.getAudioTracks()[0], orig = tr.getSettings.bind(tr);
+    tr.getSettings = () => ({ ...orig(), channelCount: 4 });
+    navigator.mediaDevices.getUserMedia = async () => dest.stream;
+    const sel = document.getElementById('sourceSel'); sel.value = 'input'; sel.dispatchEvent(new Event('change'));
+    await new Promise((r) => setTimeout(r, 400));
+    e.source.disconnect(); merger.connect(e.inNodes.splitter); // MediaStreams tragen in Chromium nur 2 Kanäle
+    const sp = ctx.createChannelSplitter(2), an = [ctx.createAnalyser(), ctx.createAnalyser()];
+    e.inNodes.merger.connect(sp); sp.connect(an[0], 0); sp.connect(an[1], 1);
+    const peak = async () => { await new Promise((r) => setTimeout(r, 200)); return an.map((x) => { const b = new Float32Array(x.fftSize); x.getFloatTimeDomainData(b); return Math.round(Math.max(...b.map(Math.abs)) * 100) / 100; }); };
+    const out = { options: [...document.querySelectorAll('#inRoute option')].map((o) => o.value) };
+    for (const v of ['2,3', '3,3', '0,1']) {
+      const rs = document.getElementById('inRoute'); rs.value = v; rs.dispatchEvent(new Event('change'));
+      out[v] = await peak();
+    }
+    return out;
+  });
+  console.log('Mehrkanal-Routing:', JSON.stringify(mc));
+  if (mc.options.join(' ') !== '0,1 2,3 0,0 1,1 2,2 3,3') fail('Kanaloptionen für 4 Kanäle falsch');
+  if (mc['2,3'].join() !== '0.4,0.8' || mc['3,3'].join() !== '0.8,0.8' || mc['0,1'].join() !== '0.1,0.2') fail('Kanalrouting falsch');
 
   if (errors.length) { console.log('Konsolenfehler:', errors); fail('Konsolenfehler vorhanden'); }
 
@@ -156,6 +233,12 @@ try {
   const overflow = await p2.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   console.log('Horizontaler Überlauf mobil:', overflow);
   if (overflow > 1) fail('Horizontaler Überlauf auf dem Handy');
+  await p2.selectOption('#sourceSel', 'input');
+  await p2.waitForTimeout(800);
+  const overflowIn = await p2.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  await p2.screenshot({ path: path.join(outDir, '12-mobile-input.png') });
+  console.log('Horizontaler Überlauf mobil mit Eingangsleiste:', overflowIn);
+  if (overflowIn > 1) fail('Eingangsleiste läuft auf dem Handy über');
   const ctx3 = await browser.newContext({ viewport: { width: 1440, height: 1000 }, colorScheme: 'light' });
   const p3 = await ctx3.newPage();
   await p3.goto(`http://localhost:${PORT}/`);

@@ -68,28 +68,73 @@ export class Engine extends EventTarget {
       try { this.source.disconnect(); } catch (_) { /* nicht verbunden */ }
       this.source = null;
     }
+    if (this.inNodes) {
+      try { this.inNodes.splitter.disconnect(); } catch (_) { /* nicht verbunden */ }
+      try { this.inNodes.merger.disconnect(); } catch (_) { /* nicht verbunden */ }
+      this.inNodes = null;
+    }
     if (this.mediaStream) { this.mediaStream.getTracks().forEach((t) => t.stop()); this.mediaStream = null; }
+    this.inputInfo = null;
     this.sourceKind = 'none';
   }
 
-  async useMic(deviceId) {
+  /**
+   * Audio-Eingang (Interface, USB-Gerät, Mikrofon). Fordert so viele Kanäle an, wie das Gerät
+   * und der Browser hergeben, und routet ein wählbares Stereo-Paar oder einen Mono-Kanal.
+   */
+  async useInput(deviceId, route) {
     await this.init();
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error('Mikrofon ist hier nicht verfügbar (benötigt HTTPS oder localhost)');
+      throw new Error('Audio-Eingänge sind hier nicht verfügbar (benötigt HTTPS oder localhost)');
+    }
+    const base = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, latency: { ideal: 0 } };
+    const dev = deviceId ? { deviceId: { exact: deviceId } } : {};
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { ...base, ...dev, channelCount: { ideal: 32 } } });
+    } catch (err) {
+      if (err && (err.name === 'OverconstrainedError' || err.name === 'TypeError')) {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: { ...base, ...dev } });
+      } else throw err;
     }
     this.stopSource();
-    const constraints = {
-      audio: {
-        echoCancellation: false, noiseSuppression: false, autoGainControl: false,
-        channelCount: { ideal: 2 }, latency: { ideal: 0 },
-        ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-      },
-    };
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
     this.mediaStream = stream;
-    this.source = this.ctx.createMediaStreamSource(stream);
-    this.source.connect(this.inputGain);
-    this.sourceKind = 'mic';
+    const track = stream.getAudioTracks()[0];
+    const st = track && track.getSettings ? track.getSettings() : {};
+    const src = this.ctx.createMediaStreamSource(stream);
+    const nch = Math.max(1, Math.min(32, st.channelCount || 2));
+    const splitter = this.ctx.createChannelSplitter(nch);
+    const merger = this.ctx.createChannelMerger(2);
+    src.connect(splitter);
+    merger.connect(this.inputGain);
+    this.inNodes = { splitter, merger };
+    this.source = src;
+    this.inputInfo = {
+      label: (track && track.label) || 'Audio-Eingang',
+      deviceId: st.deviceId || deviceId || '',
+      channels: nch,
+      sampleRate: st.sampleRate || this.ctx.sampleRate,
+      latency: (st.latency || 0) + (this.ctx.baseLatency || 0) + (this.ctx.outputLatency || 0),
+    };
+    this.setInputRoute(route);
+    this.sourceKind = 'input';
+    if (track) track.addEventListener('ended', () => this.dispatchEvent(new CustomEvent('inputended')));
+    return this.inputInfo;
+  }
+
+  /** route: { a, b } mit 0-basierten Kanälen; a === b bedeutet Mono auf beide Seiten. */
+  setInputRoute(route) {
+    const n = this.inNodes, info = this.inputInfo;
+    if (!n || !info) return null;
+    const nch = info.channels;
+    let a = 0, b = nch > 1 ? 1 : 0;
+    if (route && Number.isInteger(route.a)) { a = route.a; b = Number.isInteger(route.b) ? route.b : route.a; }
+    if (a >= nch || b >= nch) { a = 0; b = nch > 1 ? 1 : 0; }
+    try { n.splitter.disconnect(); } catch (_) { /* nicht verbunden */ }
+    n.splitter.connect(n.merger, a, 0);
+    n.splitter.connect(n.merger, b, 1);
+    this.inputRoute = { a, b };
+    return this.inputRoute;
   }
 
   async listInputs() {

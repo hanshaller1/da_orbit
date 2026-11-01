@@ -404,7 +404,7 @@ document.querySelectorAll('[data-g]').forEach((el) => {
   el.addEventListener('change', () => {
     const k = el.dataset.g;
     global[k] = el.type === 'number' || k !== 'expTarget' ? Number(el.value) : el.value;
-    saveGlobal(global); applyGlobal();
+    saveGlobal(global); applyGlobal(); syncSettingsForm();
   });
 });
 function applyGlobal() {
@@ -413,19 +413,9 @@ function applyGlobal() {
   midi.channel = global.midiChannel | 0;
   updateFootswitchUI();
 }
-$('settingsBtn').addEventListener('click', async () => {
+$('settingsBtn').addEventListener('click', () => {
   syncSettingsForm();
-  try {
-    const devs = await engine.listInputs();
-    const sel = $('deviceSel');
-    const cur = sel.value;
-    sel.innerHTML = '<option value="">Standard</option>' + devs.map((d, i) => `<option value="${d.deviceId}">${d.label || 'Eingang ' + (i + 1)}</option>`).join('');
-    sel.value = cur;
-  } catch (_) { /* keine Geräteliste */ }
   $('settingsDlg').showModal();
-});
-$('deviceSel').addEventListener('change', async (e) => {
-  try { await ensureStarted(); await engine.useMic(e.target.value || undefined); $('sourceSel').value = 'mic'; updateSrcText(); toast('Audio-Eingang gewechselt'); } catch (err) { toast('Eingang nicht verfügbar'); }
 });
 $('panicBtn').addEventListener('click', () => { engine.post({ type: 'panic' }); toast('Puffer geleert'); });
 $('resetGlobalBtn').addEventListener('click', () => { Object.assign(global, DEFAULT_GLOBAL); saveGlobal(global); syncSettingsForm(); applyGlobal(); toast('Zurückgesetzt'); });
@@ -437,13 +427,25 @@ $('helpEffects').innerHTML = EFFECTS.map((fx) => `
   </div>`).join('');
 
 /* ---------------- MIDI ---------------- */
-let midiActTimer = 0;
+let midiActTimer = 0, clockWatch = 0;
+function setExtClock(on) {
+  if (ui.extClock === on) return;
+  ui.extClock = on;
+  engine.post({ type: 'extClock', on });
+  $('clockChip').hidden = !on;
+  if (on) toast('Tempo folgt der MIDI-Clock');
+}
 const midi = new Midi({
   cc: (cc, val) => handleCC(cc, val),
   pc: (p) => handlePC(p),
-  clockStart: () => { if (global.midiClock) { ui.extClock = true; engine.post({ type: 'extClock', on: true }); $('clockChip').hidden = false; } },
-  clockStop: () => { ui.extClock = false; engine.post({ type: 'extClock', on: false }); $('clockChip').hidden = true; },
-  clockBpm: (bpm) => { if (global.midiClock && ui.extClock && Math.abs(bpm - ui.bpm) > 0.4) setBpm(bpm, false); },
+  clockStart: () => { if (global.midiClock) { setExtClock(true); engine.post({ type: 'bpm', bpm: ui.bpm, resync: true }); } },
+  clockStop: () => { /* Clock-Ticks laufen bei vielen Geräten weiter; der Watchdog beendet den externen Takt */ },
+  clockBpm: (bpm) => {
+    if (!global.midiClock) return;
+    setExtClock(true);
+    clearTimeout(clockWatch); clockWatch = setTimeout(() => setExtClock(false), 1500);
+    if (Math.abs(bpm - ui.bpm) > 0.4) setBpm(Math.round(bpm * 10) / 10, false);
+  },
   activity: () => { $('midiBtn').classList.add('is-act'); clearTimeout(midiActTimer); midiActTimer = setTimeout(() => $('midiBtn').classList.remove('is-act'), 120); },
   devices: (names) => { if (names.length) toast('MIDI: ' + names.join(', ')); },
 });
@@ -540,6 +542,10 @@ engine.addEventListener('state', (ev) => {
   const s = ev.detail;
   viz.update(s);
   const meter = (id, v) => { $(id).style.width = Math.min(100, Math.sqrt(v) * 100) + '%'; };
+  if (!$('inputBar').hidden) {
+    const lv = s.peakIn > 0.98 ? 'clip' : s.peakIn > 0.003 ? 'sig' : '';
+    const led = $('inLed'); if (led.dataset.lv !== lv) { led.dataset.lv = lv; }
+  }
   meter('meterIn', s.peakIn); meter('meterL', s.peakL); meter('meterR', s.peakR);
   if (Math.abs(s.bpm - ui.bpm) > 0.05 && !ui.extClock) { ui.bpm = s.bpm; }
   $('bpmText').textContent = Math.round(s.bpm) + ' BPM';
@@ -579,6 +585,137 @@ engine.addEventListener('state', (ev) => {
   }
 });
 
+/* ---------------- Audio-Eingang (Interface, USB-Gerät, Mikrofon) ---------------- */
+const INPUT_KEY = 'da_orbit.input.v1';
+function loadInputPrefs() {
+  try { const v = JSON.parse(localStorage.getItem(INPUT_KEY)); return v && typeof v === 'object' ? v : {}; } catch (_) { return {}; }
+}
+function saveInputPrefs() { try { localStorage.setItem(INPUT_KEY, JSON.stringify(inputPrefs)); } catch (_) { /* kein Speicher */ } }
+const inputPrefs = loadInputPrefs();
+let inputDevices = [], inputLost = false;
+
+function routeLabel(r) { return !r ? '' : r.a === r.b ? `Kanal ${r.a + 1}` : `Kanal ${r.a + 1}+${r.b + 1}`; }
+// Gespeichertes Gerät wiederfinden: erst über die ID, sonst über den Namen
+function resolveDevice() {
+  if (!inputPrefs.deviceId && !inputPrefs.label) return undefined;
+  if (!inputDevices.some((d) => d.deviceId)) return inputPrefs.deviceId;
+  const byId = inputDevices.find((d) => d.deviceId === inputPrefs.deviceId);
+  if (byId) return byId.deviceId;
+  const byLabel = inputPrefs.label && inputDevices.find((d) => d.label === inputPrefs.label);
+  return byLabel ? byLabel.deviceId : undefined;
+}
+async function refreshDevices() {
+  try { inputDevices = await engine.listInputs(); } catch (_) { inputDevices = []; }
+  fillDeviceSelect();
+  return inputDevices;
+}
+function fillDeviceSelect() {
+  const sel = $('inDevice'), info = engine.inputInfo;
+  sel.textContent = '';
+  inputDevices.forEach((d, i) => sel.add(new Option(d.label || `Eingang ${i + 1}`, d.deviceId)));
+  if (info && info.deviceId && !inputDevices.some((d) => d.deviceId === info.deviceId)) sel.add(new Option(info.label, info.deviceId));
+  if (!sel.options.length) sel.add(new Option('Standard-Eingang', ''));
+  const cur = info ? info.deviceId : resolveDevice();
+  if (cur !== undefined && [...sel.options].some((o) => o.value === cur)) sel.value = cur;
+}
+function fillRouteSelect() {
+  const sel = $('inRoute'), info = engine.inputInfo;
+  sel.textContent = '';
+  if (!info) { sel.add(new Option('–', '')); return; }
+  const n = info.channels;
+  for (let a = 0; a + 1 < n; a += 2) sel.add(new Option(`${a + 1}+${a + 2} Stereo-Paar`, `${a},${a + 1}`));
+  for (let a = 0; a < n; a++) sel.add(new Option(`${a + 1} Mono`, `${a},${a}`));
+  const r = engine.inputRoute;
+  if (r) sel.value = `${r.a},${r.b}`;
+}
+function updateInputBar() {
+  if (engine.sourceKind !== 'input' && engine.sourceKind !== 'none') inputLost = false;
+  const show = engine.sourceKind === 'input' || inputLost;
+  $('inputBar').hidden = !show;
+  if (!show) return;
+  syncSettingsForm();
+  fillDeviceSelect(); fillRouteSelect();
+  const info = engine.inputInfo, r = engine.inputRoute;
+  $('inRoute').disabled = !info || info.channels < 2;
+  $('inMode').disabled = !info || !r || r.a === r.b;
+  $('inputBar').classList.toggle('is-lost', !info);
+  const hints = [];
+  if (info) {
+    const khz = (info.sampleRate / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1 });
+    const lat = info.latency > 0 ? ` · ca. ${Math.round(info.latency * 1000)} ms` : '';
+    $('inInfo').textContent = `${info.channels} ${info.channels === 1 ? 'Kanal' : 'Kanäle'} · ${khz} kHz${lat}`;
+    if (info.channels === 2) hints.push('Mehr Eingänge am Interface? Wie viele Kanäle ankommen, entscheiden Browser und Treiber; oft sind es nur die ersten zwei.');
+    if (/mic|mikro|microphone|headset/i.test(info.label)) hints.push('Mikrofon: bitte Kopfhörer benutzen, sonst koppelt der Lautsprecher zurück.');
+  } else {
+    $('inInfo').textContent = 'getrennt';
+    hints.push('Das Gerät wurde getrennt. Sobald es wieder angeschlossen ist, verbindet da_orbit es automatisch.');
+  }
+  $('inHint').textContent = hints.join(' ');
+  $('inHint').hidden = !hints.length;
+}
+async function startInput(deviceId) {
+  if (!inputDevices.length) await refreshDevices();
+  const id = deviceId !== undefined ? deviceId : resolveDevice();
+  let info;
+  try {
+    info = await engine.useInput(id || undefined);
+  } catch (err) {
+    // gespeichertes Gerät nicht mehr da → Standard-Eingang
+    if (id && err && (err.name === 'OverconstrainedError' || err.name === 'NotFoundError')) info = await engine.useInput(undefined);
+    else throw err;
+  }
+  inputLost = false;
+  const saved = inputPrefs.routes && inputPrefs.routes[info.label];
+  if (saved) engine.setInputRoute(saved);
+  inputPrefs.deviceId = info.deviceId; inputPrefs.label = info.label;
+  saveInputPrefs();
+  await refreshDevices(); // nach der Freigabe sind die Gerätenamen lesbar
+  updateSrcText();
+  return info;
+}
+$('inDevice').addEventListener('change', async (e) => {
+  const seq = ++srcSeq;
+  try {
+    await ensureStarted();
+    const info = await startInput(e.target.value);
+    if (seq !== srcSeq) return;
+    $('sourceSel').value = 'input'; ui.srcVal = 'input'; updateSrcText();
+    toast(info.label + ' aktiv');
+  } catch (err) { toast(errorText(err)); updateInputBar(); }
+});
+$('inRoute').addEventListener('change', (e) => {
+  const [a, b] = e.target.value.split(',').map(Number);
+  const r = engine.setInputRoute({ a, b });
+  if (!r) return;
+  if (r.a !== r.b && global.mono) { global.mono = 0; saveGlobal(global); applyGlobal(); toast('Stereo-Verarbeitung an'); }
+  inputPrefs.routes = { ...(inputPrefs.routes || {}), [engine.inputInfo.label]: r };
+  saveInputPrefs();
+  updateSrcText();
+});
+$('inRefresh').addEventListener('click', async () => {
+  await refreshDevices(); updateInputBar();
+  toast(`${inputDevices.length} ${inputDevices.length === 1 ? 'Eingang' : 'Eingänge'} gefunden`);
+});
+engine.addEventListener('inputended', () => {
+  if (engine.sourceKind !== 'input') return;
+  engine.stopSource();
+  inputLost = true;
+  toast('Audio-Eingang getrennt');
+  updateSrcText();
+});
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener('devicechange', async () => {
+    await refreshDevices();
+    if (inputLost && ui.srcVal === 'input') {
+      const id = resolveDevice();
+      if (id && inputDevices.some((d) => d.deviceId === id)) {
+        try { const info = await startInput(id); toast(info.label + ' wieder verbunden'); } catch (_) { /* weiter warten */ }
+      }
+    }
+    updateInputBar();
+  });
+}
+
 /* ---------------- Quellen & Start ---------------- */
 async function ensureStarted() {
   if (ui.started) { await engine.init(); return; }
@@ -593,38 +730,44 @@ async function ensureStarted() {
 let srcSeq = 0;
 async function useSource(val) {
   const seq = ++srcSeq;
+  if (val !== 'input') inputLost = false;
   await ensureStarted();
   if (val.startsWith('demo:')) {
     const bpm = await engine.useDemo(val.slice(5));
     if (!ui.extClock) setBpm(bpm, true);
     toast(DEMOS.find((d) => 'demo:' + d.id === val).name + ' läuft in Schleife');
-  } else if (val === 'mic') {
-    await engine.useMic($('deviceSel').value || undefined);
-    toast('Mikrofon aktiv – Kopfhörer benutzen!');
+  } else if (val === 'input') {
+    const info = await startInput();
+    if (seq !== srcSeq) return;
+    toast(info.label + ' aktiv');
   } else if (val === 'file') {
     if (engine.fileBuffer) { await engine.useFile(); toast(engine.fileName + ' läuft in Schleife'); } else $('sourceFile').click();
   } else engine.useNone();
   if (seq !== srcSeq) return;
-  $('sourceSel').value = val;
+  $('sourceSel').value = val; ui.srcVal = val;
   updateSrcText();
 }
 function updateSrcText() {
   const sel = $('sourceSel');
-  const txt = engine.sourceKind === 'file' ? engine.fileName : sel.options[sel.selectedIndex].text.replace('Demo: ', '');
+  const txt = engine.sourceKind === 'file' ? engine.fileName
+    : engine.sourceKind === 'input' && engine.inputInfo ? engine.inputInfo.label + ' ' + routeLabel(engine.inputRoute)
+      : sel.options[sel.selectedIndex].text.replace('Demo: ', '');
   $('srcText').textContent = engine.sourceKind === 'none' ? 'keiner' : txt;
   $('srcText').title = txt;
+  updateInputBar();
 }
 $('sourceSel').addEventListener('change', async (e) => {
-  try { await useSource(e.target.value); } catch (err) { toast(errorText(err)); }
+  try { await useSource(e.target.value); } catch (err) { toast(errorText(err)); $('sourceSel').value = ui.srcVal || 'none'; updateSrcText(); }
 });
 $('sourceFile').addEventListener('change', async (e) => {
   const f = e.target.files[0]; e.target.value = '';
   if (!f) return;
-  try { await ensureStarted(); await engine.loadFile(f); await engine.useFile(); $('sourceSel').value = 'file'; updateSrcText(); toast(f.name + ' läuft in Schleife'); } catch (err) { toast('Datei konnte nicht gelesen werden'); }
+  try { await ensureStarted(); await engine.loadFile(f); await engine.useFile(); $('sourceSel').value = 'file'; ui.srcVal = 'file'; updateSrcText(); toast(f.name + ' läuft in Schleife'); } catch (err) { toast('Datei konnte nicht gelesen werden'); }
 });
 function errorText(err) {
-  if (err && err.name === 'NotAllowedError') return 'Mikrofon-Zugriff wurde verweigert oder ist in dieser Ansicht gesperrt';
+  if (err && err.name === 'NotAllowedError') return 'Zugriff auf Audio-Eingänge wurde verweigert oder ist in dieser Ansicht gesperrt';
   if (err && err.name === 'NotFoundError') return 'Kein Audio-Eingang gefunden';
+  if (err && err.name === 'NotReadableError') return 'Das Gerät ist belegt oder lässt sich nicht öffnen (anderes Programm schließen?)';
   return (err && err.message) || String(err);
 }
 document.querySelectorAll('[data-start]').forEach((b) => b.addEventListener('click', async () => {
@@ -640,7 +783,7 @@ $('startFile').addEventListener('change', async (e) => {
   if (!f) return;
   try {
     await ensureStarted(); await engine.loadFile(f); await engine.useFile();
-    $('sourceSel').value = 'file'; updateSrcText(); $('startOverlay').hidden = true; toast(f.name + ' läuft in Schleife');
+    $('sourceSel').value = 'file'; ui.srcVal = 'file'; updateSrcText(); $('startOverlay').hidden = true; toast(f.name + ' läuft in Schleife');
   } catch (err) { const el = $('startError'); el.hidden = false; el.textContent = 'Datei konnte nicht gelesen werden'; }
 });
 // Drag & Drop einer Audiodatei
@@ -649,7 +792,7 @@ window.addEventListener('drop', async (e) => {
   e.preventDefault();
   const f = e.dataTransfer && e.dataTransfer.files[0];
   if (!f || !f.type.startsWith('audio')) return;
-  try { await ensureStarted(); await engine.loadFile(f); await engine.useFile(); $('sourceSel').value = 'file'; updateSrcText(); $('startOverlay').hidden = true; toast(f.name + ' läuft in Schleife'); } catch (_) { toast('Datei konnte nicht gelesen werden'); }
+  try { await ensureStarted(); await engine.loadFile(f); await engine.useFile(); $('sourceSel').value = 'file'; ui.srcVal = 'file'; updateSrcText(); $('startOverlay').hidden = true; toast(f.name + ' läuft in Schleife'); } catch (_) { toast('Datei konnte nicht gelesen werden'); }
 });
 
 $('inGain').addEventListener('input', (e) => engine.ctx && engine.setInputGain(Number(e.target.value)));

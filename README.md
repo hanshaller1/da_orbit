@@ -15,7 +15,26 @@ node server.mjs          # oder: npm start
 
 Alternativ: `python3 -m http.server 8080`. Getestet mit Chromium; Firefox und Safari unterstützen AudioWorklet ebenfalls.
 
-Beim Start wählst du eine Quelle: eingebaute Demo (Zupf-Arpeggio, E-Piano, Beat), Mikrofon/Line-In (Audio-Interface) oder eine Audiodatei (auch per Drag & Drop). Mit Mikrofon bitte Kopfhörer verwenden.
+Beim Start wählst du eine Quelle: eingebaute Demo (Zupf-Arpeggio, E-Piano, Beat), einen Audio-Eingang (Interface, USB-Gerät, Mikrofon) oder eine Audiodatei (auch per Drag & Drop). Mit Mikrofon bitte Kopfhörer verwenden.
+
+## Eingänge: Audio-Interface, Syntakt & Co.
+
+Quelle **Audio-Eingang** wählen; der Browser fragt einmal nach der Freigabe. Danach erscheint über dem Gerät die Eingangsleiste:
+
+* **Gerät**: alle Audio-Eingänge des Systems, z. B. Audio-Interface, Syntakt/Digitakt per USB, eingebautes Mikrofon. Die Liste aktualisiert sich beim An- und Abstecken (↻ liest sie manuell neu ein).
+* **Kanäle**: Stereo-Paare (1+2, 3+4 …) oder einzelne Mono-Kanäle. Eine Gitarre an Eingang 1 eines Interfaces also als „1 Mono“ wählen, den Syntakt-Hauptausgang als „1+2 Stereo-Paar“.
+* **Verarbeitung**: Stereo oder Mono-Summe (dieselbe Einstellung wie „Eingangsmodus“ in den Einstellungen).
+* Gerät und Kanalwahl werden gespeichert. Wird das Gerät getrennt, verbindet da_orbit es beim Wiedereinstecken automatisch.
+
+Wie viele Kanäle eines Mehrkanal-Interfaces im Browser ankommen, entscheiden Browser und Treiber; oft sind es nur die ersten zwei. da_orbit fordert bis zu 32 Kanäle an und zeigt an, wie viele tatsächlich freigegeben wurden.
+
+**Syntakt, Digitakt & Co.**
+
+* **Per USB**: Läuft das Gerät im USB-Audio- oder Overbridge-Modus, erscheint es als eigenes Eingangsgerät; der Hauptausgang liegt auf 1+2. Overbridge stellt die Einzelspuren als weitere Kanäle bereit, sie sind aber nur wählbar, wenn der Browser mehr als zwei Kanäle durchreicht.
+* **Analog**: Ausgänge ins Audio-Interface, dort das passende Eingangspaar wählen. Das ist auch der Weg, einzelne Spuren zuverlässig zu nutzen.
+* **Tempo**: In da_orbit **MIDI** aktivieren und am Gerät das Senden der Clock einschalten (bei Elektron „Clock Send“). da_orbit folgt der Clock auch ohne Start-Befehl; ein Start setzt den Takt auf die Eins. Ohne Clock übernimmt nach etwa 1,5 s wieder das interne Tempo.
+
+Echo-Unterdrückung, Rauschfilter und automatische Pegelanpassung des Browsers sind abgeschaltet. Für geringe Latenz am Interface eine kleine Puffergröße einstellen; die Leiste zeigt die geschätzte Latenz.
 
 ## Bedienung
 
@@ -59,15 +78,15 @@ Tastatur: `Q` `W` `E` Fußschalter (halten = lang drücken), `L` Looper, `R` Loo
 ## Presets, Einstellungen, MIDI
 
 * 16 User-Presets in 4 Farbbänken. Gespeichert werden alle Regler, Optionen und der aktuelle Loop (Loop-Audio in IndexedDB, Rest in localStorage). Export/Import der Reglerstellungen als JSON.
-* Globale Einstellungen: Mono/Stereo-Eingang, Instrument/Line, Audio-Eingangsgerät, Hold umschaltend/momentan, Bypass-Art (ohne Trails, mit Trails, hart), Looper-Reihenfolge und -Fade, Vorschlagswerte beim Effektwechsel, MIDI-Kanal, MIDI-Clock, Expression-Pedal per MIDI-CC.
-* Web-MIDI: Programmwechsel 1–44 (Reihenfolge des Originals) und 45–60 für User-Presets, die CC-Belegung des Originals (CC 5–35, 47, 48, 93, 102), MIDI-Clock mit Start/Stop.
+* Globale Einstellungen: Mono/Stereo-Eingang, Instrument/Line, Hold umschaltend/momentan, Bypass-Art (ohne Trails, mit Trails, hart), Looper-Reihenfolge und -Fade, Vorschlagswerte beim Effektwechsel, MIDI-Kanal, MIDI-Clock, Expression-Pedal per MIDI-CC.
+* Web-MIDI: Programmwechsel 1–44 (Reihenfolge des Originals) und 45–60 für User-Presets, die CC-Belegung des Originals (CC 5–35, 47, 48, 93, 102), MIDI-Clock (auch ohne Start-Befehl, Start setzt die Eins).
 * Aufnahme des Ausgangs als WebM/Opus.
 
 ## Tests
 
 ```bash
 node tests/dsp-test.mjs       # alle 44 Algorithmen, Looper, Quantisierung, Hold, Bypass offline in Node
-node tests/browser-test.mjs   # Chromium via Playwright: UI, Effekte, Hold, Looper, Presets, Mikrofon, Mobil-Layout
+node tests/browser-test.mjs   # Chromium via Playwright: UI, Effekte, Hold, Looper, Presets, Audio-Eingang mit Kanalwahl, Mobil-Layout
 ```
 
 ## Aufbau
