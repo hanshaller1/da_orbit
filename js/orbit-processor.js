@@ -13,16 +13,27 @@
  */
 
 const SR = sampleRate;
-const BUF_BITS = 21;
-const BUF = 1 << BUF_BITS;            // ~43 s bei 48 kHz
+// Verlaufspuffer: mindestens ~42 s, auch bei 88,2/96 kHz (Zweierpotenz für Masken-Arithmetik)
+const BUF_BITS = Math.max(21, Math.ceil(Math.log2(42 * SR)));
+const BUF = 1 << BUF_BITS;
 const MASK = BUF - 1;
 const MAX_VOICES = 96;
+const VOICE_RESERVE = 6;              // ab hier werden leise Stimmen weich ausgeblendet statt abgeschnitten
 const NUM_TAPS = 8;
 const HOLD_MAX = Math.floor(8 * SR);
 const LOOP_MAX = Math.floor(60 * SR);
 const SUBDIV = [4, 2, 1, 0.5, 0.25, 0.125];
 const MOD_SIZE = 4096, MOD_MASK = MOD_SIZE - 1;
 const TWO_PI = Math.PI * 2;
+const DECLICK = Math.max(16, Math.round(0.006 * SR)); // kurze Blende gegen Knackser (~6 ms)
+const XFER_CHUNK = 16384;             // Loop-Export/-Import: Samples pro Block (echtzeitsicher statt alles auf einmal)
+const SWEEP_CHUNK = 65536;            // Overdub-Ebene leeren: Samples pro Block
+const TAP_MIN = 256;                  // kürzeste Tap-Verzögerung; muss > Blockgröße sein (Feedback wird im Block geschrieben)
+const DMIX = [0.22, 0.25, 0.3, 0.38]; // Delay-Anteil je Hall-Typ
+
+// Erlaubte Parameter: alles Übrige ist 0..1, diese hier sind ganzzahlig mit Bereich
+const PARAM_INT = { timeMode: [0, 1], effect: [0, 10], variation: [0, 3], effRev: [0, 1], mono: [0, 1], inputLine: [0, 1], bypassStyle: [0, 2] };
+const LOOP_FLAGS = ['pre', 'quant', 'only', 'burst'];
 
 const FX = { MOSAIC: 0, SEQ: 1, GLIDE: 2, HAZE: 3, TUNNEL: 4, STRUM: 5, BLOCKS: 6, INTERRUPT: 7, ARP: 8, PATTERN: 9, WARP: 10 };
 // Pegelausgleich je Effekt (empirisch mit tests/dsp-test.mjs abgestimmt)
@@ -50,6 +61,26 @@ function rd(buf, p) { // lineare Interpolation im Ringpuffer, p in (-BUF, BUF)
   if (p < 0) p += BUF;
   const i0 = p | 0, f = p - i0, a = buf[i0];
   return a + (buf[(i0 + 1) & MASK] - a) * f;
+}
+const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+// Nur bekannte Schlüssel mit endlichen Zahlen übernehmen (Presets/Speicher können beliebige Werte enthalten;
+// ein einziges NaN würde sonst die Glättungs- und Filterzustände dauerhaft lahmlegen)
+function applyParams(p, values) {
+  if (!values || typeof values !== 'object') return;
+  for (const k of Object.keys(values)) {
+    if (!Object.prototype.hasOwnProperty.call(p, k)) continue;
+    let v = values[k];
+    if (typeof v === 'boolean') v = v ? 1 : 0;
+    if (!isNum(v)) continue;
+    const r = PARAM_INT[k];
+    p[k] = r ? clamp(Math.round(v), r[0], r[1]) : clamp(v, 0, 1);
+  }
+}
+function applyLooperOpts(lp, values) {
+  if (!values || typeof values !== 'object') return;
+  for (const k of LOOP_FLAGS) if (k in values) lp[k] = !!values[k];
+  if (isNum(values.order)) lp.order = clamp(Math.round(values.order), 0, 1);
+  if (isNum(values.fadeShape)) lp.fadeShape = clamp(Math.round(values.fadeShape), 0, 3);
 }
 
 class Rng {
@@ -106,6 +137,7 @@ class Voice {
     this.crushQ = 0; this.crushHold = 1; this.crushCnt = 0; this.chL = 0; this.chR = 0;
     this.smDepth = 0; this.smRate = 0; this.smPh = 0; this.smEnv = 0;
     this.level = 0;
+    this.kill = 0; // > 0: Stimme wird gerade weich ausgeblendet (verbleibende Samples)
   }
 }
 
@@ -120,6 +152,8 @@ class Tap {
     this.a1 = 0; this.a2 = 0; this.a3 = 0; this.k = 1;
     this.s1L = 0; this.s2L = 0; this.s1R = 0; this.s2R = 0;
     this.level = 0;
+    // geglättete Werte (Pegel, Panorama, Feedback-Anteil), damit Reglerbewegungen nicht knistern
+    this.gS = 0; this.plS = Math.SQRT1_2; this.prS = Math.SQRT1_2; this.fbT = 0; this.fbW = 0;
   }
 }
 
@@ -129,41 +163,52 @@ class Space {
     this.lensMs = [31.3, 37.9, 41.3, 45.7, 53.9, 61.1, 67.3, 79.1];
     this.size = 1 << Math.ceil(Math.log2(0.0791 * 2.0 * SR + 64));
     this.mask = this.size - 1;
-    this.bufs = []; this.lens = new Float64Array(8); this.g = new Float64Array(8); this.lp = new Float64Array(8);
+    this.bufs = []; this.lens = new Float64Array(8); this.lensM = new Float64Array(8); this.lensT = new Float64Array(8); this.g = new Float64Array(8); this.lp = new Float64Array(8);
     for (let i = 0; i < 8; i++) this.bufs.push(new Float32Array(this.size));
     this.w = 0;
     this.apMs = [4.77, 3.59, 12.73, 9.31];
     this.ap = this.apMs.map(ms => ({ buf: new Float32Array(1 << Math.ceil(Math.log2(ms * 0.001 * SR + 8))), len: Math.round(ms * 0.001 * SR), w: 0 }));
     this.preSize = 1 << Math.ceil(Math.log2(0.08 * SR + 8));
-    this.preL = new Float32Array(this.preSize); this.preR = new Float32Array(this.preSize); this.preW = 0; this.preD = 1;
+    this.preL = new Float32Array(this.preSize); this.preR = new Float32Array(this.preSize); this.preW = 0; this.preD = 1; this.preDM = 1; this.preDT = 1;
     this.dlySize = 1 << Math.ceil(Math.log2(2.6 * SR));
     this.dlyL = new Float32Array(this.dlySize); this.dlyR = new Float32Array(this.dlySize); this.dlyW = 0;
     this.dlyD = 0.4 * SR; this.dlyDT = 0.4 * SR; this.dlyLpL = 0; this.dlyLpR = 0;
-    this.modPh = 0; this.modDepth = 0; this.damp = 0.3; this.mode = -1; this.timeScale = 1;
+    this.modPh = 0; this.modDepth = 0; this.modDepthT = 0; this.damp = 0.3; this.dampS = 0.3; this.mode = -1; this.timeScale = 1;
+    this.dmix = DMIX[1]; this.dmixT = DMIX[1];
     this.oL = 0; this.oR = 0;
+    this._y = new Float64Array(8);
     this.setMode(1, 1);
+    this.lens.set(this.lensT); this.lensM.set(this.lensT); this.preD = this.preDM = this.preDT; this.modDepth = this.modDepthT; this.dmix = this.dmixT;
+    this.dampS = this.damp;
   }
+  // Setzt nur Zielwerte; Längen, Pre-Delay, Modulation und Delay-Anteil gleiten in process() dorthin,
+  // sonst springen die Lesepositionen beim Wechsel des Hall-Typs und es knackt. Längen und Pre-Delay
+  // gleiten zweistufig, damit auch die Lesegeschwindigkeit sanft anläuft.
   setMode(m, timeScale) {
     if (m === this.mode && timeScale === this.timeScale) return;
     this.mode = m; this.timeScale = timeScale;
     const size = [0.55, 1.0, 1.45, 1.9][m];
     const rt = [0.8, 2.1, 4.2, 11][m] * timeScale;
     this.damp = [0.12, 0.58, 0.3, 0.4][m];
-    this.preD = Math.max(1, Math.round([4, 12, 25, 45][m] * 0.001 * SR));
-    this.modDepth = [0, 0.5, 3, 10][m];
+    this.preDT = Math.max(1, Math.round([4, 12, 25, 45][m] * 0.001 * SR));
+    this.modDepthT = [0, 0.5, 3, 10][m];
+    this.dmixT = DMIX[m];
     for (let i = 0; i < 8; i++) {
       const L = this.lensMs[i] * 0.001 * SR * size;
-      this.lens[i] = L;
+      this.lensT[i] = L;
       this.g[i] = Math.pow(10, -3 * L / (rt * SR));
     }
   }
   setDelayTime(samples) { this.dlyDT = clamp(samples, 0.05 * SR, 2.5 * SR); }
   process(inL, inR) {
-    // Pre-Delay
+    // Pre-Delay (gleitend, mit Interpolation)
     const pm = this.preSize - 1;
     this.preL[this.preW] = inL; this.preR[this.preW] = inR;
-    const pr = (this.preW - this.preD) & pm;
-    let xL = this.preL[pr], xR = this.preR[pr];
+    this.preDM += (this.preDT - this.preDM) * 0.0005; this.preD += (this.preDM - this.preD) * 0.0005;
+    let pp = this.preW - this.preD; if (pp < 0) pp += this.preSize;
+    const p0 = pp | 0, pf = pp - p0, p1 = (p0 + 1) & pm, pi0 = p0 & pm;
+    let xL = this.preL[pi0] + (this.preL[p1] - this.preL[pi0]) * pf;
+    let xR = this.preR[pi0] + (this.preR[p1] - this.preR[pi0]) * pf;
     this.preW = (this.preW + 1) & pm;
     // Diffusion (Allpässe, mono-summiert + Stereo-Rest)
     let x = (xL + xR) * 0.5;
@@ -176,11 +221,14 @@ class Space {
     }
     const side = (xL - xR) * 0.5;
     // FDN lesen
-    const mask = this.mask, w = this.w, b = this.bufs, lens = this.lens, lp = this.lp, d = this.damp;
+    this.dampS += (this.damp - this.dampS) * 0.0005;
+    const mask = this.mask, w = this.w, b = this.bufs, lens = this.lens, lensM = this.lensM, lensT = this.lensT, lp = this.lp, d = this.dampS;
     this.modPh += 0.37 / SR; if (this.modPh > 1) this.modPh -= 1;
-    const mo = this.modDepth > 0 ? this.modDepth * Math.sin(TWO_PI * this.modPh) : 0;
-    const y = this._y || (this._y = new Float64Array(8));
+    this.modDepth += (this.modDepthT - this.modDepth) * 0.0003;
+    const mo = this.modDepth > 1e-3 ? this.modDepth * Math.sin(TWO_PI * this.modPh) : 0;
+    const y = this._y;
     for (let i = 0; i < 8; i++) {
+      lensM[i] += (lensT[i] - lensM[i]) * 0.0004; lens[i] += (lensM[i] - lens[i]) * 0.0004;
       let L = lens[i];
       if (i < 2) L += (i === 0 ? mo : -mo);
       let p = w - L; if (p < 0) p += this.size;
@@ -216,14 +264,19 @@ class Space {
     this.dlyL[this.dlyW] = (inL + inR) * 0.5 + this.dlyLpR * 0.42;
     this.dlyR[this.dlyW] = this.dlyLpL * 0.42;
     this.dlyW = (this.dlyW + 1) & dm;
-    const dmix = [0.22, 0.25, 0.3, 0.38][this.mode];
-    this.oL = rL + dL * dmix;
-    this.oR = rR + dR * dmix;
+    this.dmix += (this.dmixT - this.dmix) * 0.0005;
+    this.oL = rL + dL * this.dmix;
+    this.oR = rR + dR * this.dmix;
   }
   clear() {
     for (const bb of this.bufs) bb.fill(0);
     this.lp.fill(0); this.dlyL.fill(0); this.dlyR.fill(0); this.preL.fill(0); this.preR.fill(0);
     for (const ap of this.ap) ap.buf.fill(0);
+    this.dlyLpL = 0; this.dlyLpR = 0; this.oL = 0; this.oR = 0;
+    // Gleitwerte direkt aufs Ziel setzen (falls ein ungültiger Wert hineingeraten ist)
+    this.lens.set(this.lensT); this.lensM.set(this.lensT); this.preD = this.preDM = this.preDT;
+    this.modDepth = this.modDepthT; this.dmix = this.dmixT; this.dampS = this.damp;
+    if (!isNum(this.dlyD)) this.dlyD = this.dlyDT;
   }
 }
 
@@ -234,21 +287,28 @@ class OrbitProcessor extends AudioWorkletProcessor {
     // Verlaufspuffer
     this.hL = new Float32Array(BUF); this.hR = new Float32Array(BUF);
     this.w = 0; this.clock = 0;
-    // Hold-Sampler
+    // Hold-Sampler (holdOn = Ziel, holdX = Überblendung 0 live … 1 Hold)
     this.holdL = new Float32Array(HOLD_MAX); this.holdR = new Float32Array(HOLD_MAX);
-    this.holdOn = false; this.holdLen = 0; this.holdPos = 0;
+    this.holdL.fill(0); this.holdR.fill(0); // Seiten jetzt anfassen statt beim ersten Hold im Audio-Takt
+    this.holdOn = false; this.holdLen = 0; this.holdPos = 0; this.holdX = 0;
     // Looper
     this.lbL = new Float32Array(LOOP_MAX); this.lbR = new Float32Array(LOOP_MAX);
     this.ldL = new Float32Array(LOOP_MAX); this.ldR = new Float32Array(LOOP_MAX);
     this.lp = {
       st: L_EMPTY, len: 0, rec: 0, pos: 0, speed: 1, speedT: 1, rev: false,
-      dubOn: true, hasDub: false, fade: 1, fadeT: 1, stopping: false,
+      dubOn: true, hasDub: false, dubG: 1, fade: 1, fadeT: 1, fadeFast: false, stopping: false,
       pre: false, quant: false, only: false, burst: false, order: 0, fadeShape: 0, fadeSec: 0.08,
     };
+    // Ausklang beim abrupten Ende der Loop-Wiedergabe (Löschen, neue Aufnahme, Stopp ohne Fade)
+    this.tail = { n: 0, pos: 0, len: 0, speed: 1, dir: 1, g: 0, dubG: 0 };
+    this.loopGen = 0;      // zählt hoch, sobald sich der Loop-Inhalt grundlegend ändert
+    this.xfer = null;      // laufender Export (getLoop) in Stücken
+    this.loading = null;   // laufender Import (setLoop) in Stücken
+    this.dubSweep = null;  // Overdub-Ebene wird in Stücken geleert
     // Stimmen & Taps
     this.voices = []; for (let i = 0; i < MAX_VOICES; i++) this.voices.push(new Voice());
     this.taps = []; for (let i = 0; i < NUM_TAPS; i++) this.taps.push(new Tap());
-    this.fbTap = -1; this.fbGain = 0; this.fbDampL = 0; this.fbDampR = 0; this.hazeFb = 0;
+    this.fbTap = -1; this.fbGain = 0; this.fbGs = 0; this.fbDampL = 0; this.fbDampR = 0; this.hazeFb = 0;
     // Block-Arbeitspuffer
     const B = 2048;
     this.wetL = new Float32Array(B); this.wetR = new Float32Array(B);
@@ -256,9 +316,10 @@ class OrbitProcessor extends AudioWorkletProcessor {
     this.rawL = new Float32Array(B); this.rawR = new Float32Array(B);
     this.lpL = new Float32Array(B); this.lpR = new Float32Array(B);
     this.lpPos = new Int32Array(B);
-    this.fbL = new Float32Array(B); this.fbR = new Float32Array(B);
     this.fbNL = new Float32Array(B); this.fbNR = new Float32Array(B);
+    this.holdXB = new Float32Array(B);
     this.duckT = new Float32Array(B);
+    this.lastRecover = -1e12;
     // Modulation & Filter
     this.modL = new Float32Array(MOD_SIZE); this.modR = new Float32Array(MOD_SIZE); this.modW = 0; this.modPh = 0;
     this.fs1L = 0; this.fs2L = 0; this.fs1R = 0; this.fs2R = 0;
@@ -281,7 +342,8 @@ class OrbitProcessor extends AudioWorkletProcessor {
     this.bypass = false; this.byN = 0; this.byT = 0; // Crossfade-Werte
     this.shapeEnv = { att: 0.45, rel: 0.45, perc: 0, rev: false };
     // Glättungs-Zustände
-    this.sm = { mixD: 1, mixW: 1, spD: 1, spW: 0.6, effVol: 1, kill: 1, fc: 20000, q: 0.7, modD: 0, loopG: 1, duck: 1 };
+    this.sm = {};
+    this.resetSmoothing();
     this.cSm = 1 - Math.exp(-1 / (0.02 * SR));
     this.cDuck = 1 - Math.exp(-1 / (0.003 * SR));
     this.cByp = 1 - Math.exp(-1 / (0.008 * SR));
@@ -302,25 +364,66 @@ class OrbitProcessor extends AudioWorkletProcessor {
 
   /* ---------------- Nachrichten ---------------- */
   onMessage(m) {
+    if (!m || typeof m !== 'object') return;
     switch (m.type) {
       case 'params': {
         const prevFx = this.p.effect, prevVar = this.p.variation;
-        Object.assign(this.p, m.values);
-        if ('time' in m.values && this.p.timeMode === 1 && !this.extClock) this.bpm = 40 + this.p.time * 200;
+        applyParams(this.p, m.values);
+        if (m.values && 'time' in m.values && this.p.timeMode === 1 && !this.extClock) this.bpm = 40 + this.p.time * 200;
         this.derive();
         if (this.p.effect !== prevFx || this.p.variation !== prevVar) this.resetAlgo();
         break;
       }
-      case 'bpm': this.bpm = clamp(m.bpm, 20, 300); if (m.resync) { this.stepPos = 1e9; this.beatPos = 0; } this.derive(); break;
+      case 'bpm':
+        if (isNum(m.bpm)) this.bpm = clamp(m.bpm, 20, 300);
+        if (m.resync) { this.stepPos = 1e9; this.beatPos = 0; }
+        this.derive();
+        break;
       case 'extClock': this.extClock = !!m.on; break;
       case 'hold': this.setHold(!!m.on); break;
       case 'bypass': this.bypass = !!m.on; if (!this.bypass && this.p.bypassStyle !== 1) this.killVoices(); break;
-      case 'looper': this.looperCmd(m.cmd, m); break;
-      case 'looperOpts': Object.assign(this.lp, m.values); break;
-      case 'setLoop': this.setLoop(m.L, m.R); break;
-      case 'getLoop': this.sendLoop(m.id); break;
-      case 'panic': this.killVoices(); this.space.clear(); this.hL.fill(0); this.hR.fill(0); break;
+      case 'looper': if (typeof m.cmd === 'string') this.looperCmd(m.cmd); break;
+      case 'looperOpts': applyLooperOpts(this.lp, m.values); break;
+      case 'setLoop': this.startLoopLoad(m.L, m.R); break;
+      case 'getLoop': this.startLoopExport(m.id); break;
+      case 'panic': this.resetDsp(true); break;
     }
+  }
+
+  resetSmoothing() {
+    Object.assign(this.sm, { mixD: 1, mixW: 1, spD: 1, spW: 0.6, effVol: 1, kill: 1, fc: 20000, q: 0.7, modD: 0, loopG: 1, duck: 1 });
+  }
+  /** Alle Effekt-Zustände auf null (Panik oder nach einem abgefangenen NaN). Der Loop bleibt erhalten. */
+  resetDsp(clearHistory) {
+    this.killVoices();
+    for (const tp of this.taps) {
+      tp.s1L = tp.s2L = tp.s1R = tp.s2R = 0; tp.env = 0; tp.ph = 0; tp.xfPh = 0; tp.level = 0;
+      if (!isNum(tp.d)) tp.d = tp.dT;
+    }
+    this.space.clear();
+    this.fs1L = this.fs2L = this.fs1R = this.fs2R = 0;
+    this.fbDampL = this.fbDampR = 0; this.fbGs = 0; this.hazeFb = 0;
+    this.fbNL.fill(0); this.fbNR.fill(0);
+    this.modL.fill(0); this.modR.fill(0);
+    this.envF = this.envS = this.envSlow = 0;
+    this.resetSmoothing();
+    const trails = this.p.bypassStyle === 1;
+    this.byN = this.bypass && !trails ? 1 : 0; this.byT = this.bypass && trails ? 1 : 0;
+    if (!isNum(this.lp.speed)) this.lp.speed = 1;
+    if (clearHistory) { this.hL.fill(0); this.hR.fill(0); this.holdOn = false; this.holdX = 0; }
+  }
+  /** Notbremse: ungültige Werte im Ausgang → Block stumm, Zustände zurücksetzen. */
+  recover(oL, oR, n) {
+    oL.fill(0, 0, n); if (oR !== oL) oR.fill(0, 0, n);
+    const again = this.clock - this.lastRecover < SR;
+    this.lastRecover = this.clock;
+    this.resetDsp(true);
+    if (again) { // kommt sofort wieder → steckt vermutlich im Loop: Loop verwerfen
+      const lp = this.lp;
+      lp.st = L_EMPTY; lp.len = 0; lp.rec = 0; lp.hasDub = false; lp.dubOn = true; lp.stopping = false; lp.pos = 0;
+      this.tail.n = 0; this.loading = null; this.dubSweep = null; this.loopGen++;
+    }
+    this.port.postMessage({ type: 'recovered', loopCleared: again });
   }
 
   derive() {
@@ -346,16 +449,16 @@ class OrbitProcessor extends AudioWorkletProcessor {
   /* ---------------- Hold-Sampler ---------------- */
   setHold(on) {
     if (on === this.holdOn) return;
-    if (!on) { this.holdOn = false; return; }
-    if (this.lp.st !== L_EMPTY) return; // nicht verfügbar, solange der Looper aktiv ist
+    if (!on) { this.holdOn = false; return; } // holdX blendet in process() zurück auf den Eingang
+    if (this.lp.st !== L_EMPTY || this.loading) return; // nicht verfügbar, solange der Looper aktiv ist
     const L = Math.floor(clamp(this.U, 0.06 * SR, HOLD_MAX));
     const F = Math.floor(Math.min(0.02 * SR, L / 4));
     const end = this.w; // nächster Schreibindex; letztes Sample = end-1
     const start = (end - L + BUF) & MASK;
-    for (let j = 0; j < L; j++) {
-      const idx = (start + j) & MASK;
-      this.holdL[j] = this.hL[idx]; this.holdR[j] = this.hR[idx];
-    }
+    // als Blockkopie (memcpy) statt Einzelschleife – läuft im Audio-Thread
+    const first = Math.min(L, BUF - start);
+    this.holdL.set(this.hL.subarray(start, start + first)); this.holdR.set(this.hR.subarray(start, start + first));
+    if (first < L) { this.holdL.set(this.hL.subarray(0, L - first), first); this.holdR.set(this.hR.subarray(0, L - first), first); }
     // Übergang Ende→Anfang überblenden
     for (let j = 0; j < F; j++) {
       const t = (j + 1) / F;
@@ -370,7 +473,14 @@ class OrbitProcessor extends AudioWorkletProcessor {
   /* ---------------- Looper ---------------- */
   looperCmd(cmd) {
     const lp = this.lp;
+    if (this.loading) { if (cmd === 'erase') this.loopErase(); return; } // Loop wird gerade geladen
     const hasLoop = lp.len > 0;
+    // Weiterspielen/Overdub während des Ausblendens nach Stopp: Ausblenden abbrechen statt trotzdem zu stoppen
+    if (lp.stopping && (cmd === 'main' || cmd === 'play' || cmd === 'dub')) {
+      lp.stopping = false; lp.fadeT = 1;
+      if (cmd === 'dub') this.loopStartDub();
+      return;
+    }
     switch (cmd) {
       case 'main':
         if (lp.st === L_EMPTY || (lp.st === L_STOP && !hasLoop)) this.loopStartRec();
@@ -393,17 +503,18 @@ class OrbitProcessor extends AudioWorkletProcessor {
         else if (lp.st === L_STOP && hasLoop) { this.loopPlay(); this.loopStartDub(); }
         break;
       case 'stop':
-        if (lp.st === L_REC) { this.loopCloseRec(L_PLAY); this.loopStop(); }
+        // während der Aufnahme: Loop sichern und gestoppt lassen (nicht erst kurz anspielen und ausblenden)
+        if (lp.st === L_REC) this.loopCloseRec(L_STOP);
         else if (lp.st === L_PLAY || lp.st === L_DUB) this.loopStop();
         break;
       case 'erase':
-        lp.st = L_EMPTY; lp.len = 0; lp.rec = 0; lp.hasDub = false; lp.dubOn = true; lp.stopping = false; lp.pos = 0;
+        this.loopErase();
         break;
       case 'undo':
         if (hasLoop && lp.hasDub) { if (lp.st === L_DUB) lp.st = L_PLAY; lp.dubOn = !lp.dubOn; }
         break;
       case 'burstStart':
-        lp.len = 0; lp.st = L_EMPTY; this.loopStartRec();
+        this.loopStartRec();
         break;
       case 'burstEnd':
         if (lp.st === L_REC) this.loopCloseRec(L_PLAY);
@@ -415,104 +526,215 @@ class OrbitProcessor extends AudioWorkletProcessor {
   }
   loopStartRec() {
     const lp = this.lp;
+    this.loopCut();
     this.holdOn = false;
+    this.dubSweep = null; this.loopGen++;
     lp.st = L_REC; lp.rec = 0; lp.len = 0; lp.hasDub = false; lp.dubOn = true; lp.pos = 0; lp.stopping = false;
-    lp.fade = 1; lp.fadeT = 1;
+    lp.fade = 1; lp.fadeT = 1; lp.fadeFast = false; lp.dubG = 1;
   }
   loopCloseRec(next) {
     const lp = this.lp;
     let len = lp.rec;
-    if (len < 0.05 * SR) { lp.st = L_EMPTY; lp.len = 0; return; }
+    if (len < 0.05 * SR) { lp.st = L_EMPTY; lp.len = 0; lp.rec = 0; return; }
     if (lp.quant) {
       const beats = Math.max(1, Math.round(len / this.spb));
       const q = Math.min(LOOP_MAX, Math.round(beats * this.spb));
-      if (q > len) { this.lbL.fill(0, len, q); this.lbR.fill(0, len, q); }
+      if (q > len) { // höchstens ein halber Schlag
+        this.lbL.fill(0, len, q); this.lbR.fill(0, len, q);
+        this.ldL.fill(0, len, q); this.ldR.fill(0, len, q);
+      }
       len = q;
     }
-    // kurze Blenden gegen Klicks an der Schleifennaht
+    // Die Overdub-Ebene wurde schon während der Aufnahme mitgeleert (loopWrite) – hier kein großes fill()
+    // im Audio-Takt (bei 60 s wären das 23 MB auf einmal).
+    this.seamFade(len);
+    lp.len = len; lp.pos = lp.rev ? len - 1 : 0;
+    lp.fade = 1; lp.fadeT = 1; lp.fadeFast = false; lp.stopping = false; lp.dubG = 1;
+    this.loopGen++;
+    if (next === L_DUB) { lp.hasDub = true; lp.st = L_DUB; }
+    else if (next === L_STOP) { lp.st = L_STOP; lp.fade = 0; }
+    else lp.st = L_PLAY;
+  }
+  // kurze Blenden gegen Klicks an der Schleifennaht
+  seamFade(len) {
     const F = Math.min(96, len >> 3);
     for (let j = 0; j < F; j++) {
       const g = j / F;
       this.lbL[j] *= g; this.lbR[j] *= g;
       this.lbL[len - 1 - j] *= g; this.lbR[len - 1 - j] *= g;
     }
-    this.ldL.fill(0, 0, len); this.ldR.fill(0, 0, len);
-    lp.len = len; lp.pos = lp.rev ? len - 1 : 0;
-    lp.fade = 1; lp.fadeT = 1; lp.stopping = false;
-    if (next === L_DUB) { lp.hasDub = true; lp.st = L_DUB; } else lp.st = L_PLAY;
   }
   loopStartDub() {
     const lp = this.lp;
-    if (!lp.dubOn) { this.ldL.fill(0, 0, lp.len); this.ldR.fill(0, 0, lp.len); lp.dubOn = true; }
+    // Nach einem Undo die alte Ebene verwerfen – stückweise in den nächsten Blöcken statt mit einem großen fill()
+    if (!lp.dubOn) { this.startDubSweep(); lp.dubOn = true; }
     lp.hasDub = true; lp.st = L_DUB;
   }
   loopPlay() {
     const lp = this.lp;
     lp.st = L_PLAY; lp.pos = lp.rev ? lp.len - 1 : 0; lp.stopping = false;
     const fadeIn = lp.fadeShape === 0 || lp.fadeShape === 1;
-    lp.fade = fadeIn ? 0 : 1; lp.fadeT = 1;
+    // ohne Fade trotzdem minimal einblenden (die Overdub-Ebene hat an der Naht keine Blende)
+    lp.fade = 0; lp.fadeT = 1; lp.fadeFast = !fadeIn;
   }
   loopStop() {
     const lp = this.lp;
     const fadeOut = lp.fadeShape === 0 || lp.fadeShape === 2;
     if (lp.st === L_DUB) lp.st = L_PLAY;
-    if (fadeOut) { lp.stopping = true; lp.fadeT = 0; } else { lp.st = L_STOP; lp.fade = 0; }
+    if (fadeOut) { lp.stopping = true; lp.fadeT = 0; lp.fadeFast = false; }
+    else { this.loopCut(); lp.st = L_STOP; lp.stopping = false; lp.fade = 0; }
   }
-  setLoop(L, R) {
+  loopErase() {
     const lp = this.lp;
+    this.loopCut();
+    lp.st = L_EMPTY; lp.len = 0; lp.rec = 0; lp.hasDub = false; lp.dubOn = true; lp.stopping = false; lp.pos = 0;
+    this.loading = null; this.dubSweep = null; this.loopGen++;
+  }
+  /** Hört die Wiedergabe abrupt auf, klingt sie über DECLICK Samples aus (statt eines Knacks). */
+  loopCut() {
+    const lp = this.lp, t = this.tail;
+    if (!((lp.st === L_PLAY || lp.st === L_DUB) && lp.len > 0 && lp.fade > 0)) return;
+    t.n = DECLICK; t.pos = lp.pos; t.len = lp.len; t.speed = lp.speed; t.dir = lp.rev ? -1 : 1;
+    t.g = lp.fade; t.dubG = lp.dubG;
+  }
+  renderTail(n) {
+    const t = this.tail, oL = this.lpL, oR = this.lpR;
+    const bL = this.lbL, bR = this.lbR, dL = this.ldL, dR = this.ldR, len = t.len;
+    for (let i = 0; i < n && t.n > 0; i++) {
+      const p = t.pos, i0 = p | 0, f = p - i0, i1 = i0 + 1 >= len ? 0 : i0 + 1;
+      let sL = bL[i0] + (bL[i1] - bL[i0]) * f;
+      let sR = bR[i0] + (bR[i1] - bR[i0]) * f;
+      if (t.dubG > 0) { sL += (dL[i0] + (dL[i1] - dL[i0]) * f) * t.dubG; sR += (dR[i0] + (dR[i1] - dR[i0]) * f) * t.dubG; }
+      const g = t.g * t.n / DECLICK;
+      oL[i] += sL * g; oR[i] += sR * g;
+      let q = p + t.speed * t.dir;
+      if (q >= len) q -= len; else if (q < 0) q += len;
+      t.pos = q; t.n--;
+    }
+  }
+  startDubSweep() {
+    const lp = this.lp;
+    if (lp.len <= 0) return;
+    // in Abspielrichtung ab der aktuellen Position: der Schreibkopf des Overdubs läuft hinter dem Löschen her
+    this.dubSweep = { pos: clamp(Math.floor(lp.pos), 0, lp.len - 1), left: lp.len, dir: lp.rev ? -1 : 1 };
+  }
+  pumpDubSweep() {
+    const s = this.dubSweep, len = this.lp.len;
+    if (!s) return;
+    if (len <= 0) { this.dubSweep = null; return; }
+    let k = Math.min(SWEEP_CHUNK, s.left);
+    s.left -= k;
+    while (k > 0) {
+      let a, b;
+      if (s.dir > 0) { a = Math.min(s.pos, len - 1); b = Math.min(len, a + k); s.pos = b >= len ? 0 : b; }
+      else { b = Math.min(s.pos, len - 1) + 1; a = Math.max(0, b - k); s.pos = a > 0 ? a - 1 : len - 1; }
+      this.ldL.fill(0, a, b); this.ldR.fill(0, a, b);
+      k -= b - a;
+    }
+    if (s.left <= 0) this.dubSweep = null;
+  }
+  /** Loop aus einer Datei/einem Preset übernehmen – in Stücken pro Block kopiert. */
+  startLoopLoad(L, R) {
+    if (!(L instanceof Float32Array)) return;
+    if (!(R instanceof Float32Array) || R.length < L.length) R = L;
     const len = Math.min(L.length, LOOP_MAX);
     if (len < 16) return;
-    this.lbL.set(L.subarray(0, len)); this.lbR.set((R || L).subarray(0, len));
-    this.ldL.fill(0, 0, len); this.ldR.fill(0, 0, len);
-    this.holdOn = false;
-    lp.len = len; lp.rec = len; lp.hasDub = false; lp.dubOn = true; lp.st = L_STOP; lp.pos = 0; lp.stopping = false;
-  }
-  sendLoop(id) {
+    this.loopCut();
     const lp = this.lp;
-    if (lp.len <= 0) { this.port.postMessage({ type: 'loopData', id, L: null, R: null, sr: SR }); return; }
-    const L = new Float32Array(lp.len), R = new Float32Array(lp.len);
-    const mixDub = lp.hasDub && lp.dubOn;
-    for (let j = 0; j < lp.len; j++) {
-      L[j] = this.lbL[j] + (mixDub ? this.ldL[j] : 0);
-      R[j] = this.lbR[j] + (mixDub ? this.ldR[j] : 0);
+    lp.st = L_EMPTY; lp.len = 0; lp.rec = 0; lp.hasDub = false; lp.dubOn = true; lp.pos = 0; lp.stopping = false;
+    this.dubSweep = null; this.loopGen++;
+    this.holdOn = false;
+    this.loading = { L, R, len, pos: 0 };
+  }
+  pumpLoopLoad() {
+    const ld = this.loading;
+    if (!ld) return;
+    const a = ld.pos, b = Math.min(ld.len, a + XFER_CHUNK);
+    this.lbL.set(ld.L.subarray(a, b), a); this.lbR.set(ld.R.subarray(a, b), a);
+    this.ldL.fill(0, a, b); this.ldR.fill(0, a, b);
+    ld.pos = b;
+    if (b < ld.len) return;
+    this.loading = null;
+    this.seamFade(ld.len); // geladene Loops haben sonst an der Naht einen Sprung
+    const lp = this.lp;
+    lp.len = ld.len; lp.rec = ld.len; lp.st = L_STOP; lp.pos = lp.rev ? ld.len - 1 : 0;
+    lp.fade = 0; lp.fadeT = 1; lp.dubG = 1;
+    this.loopGen++;
+  }
+  /** Loop zum Hauptthread schicken – in Stücken, damit der Audio-Thread nie 20+ MB auf einmal kopiert. */
+  startLoopExport(id) {
+    if (this.xfer) this.port.postMessage({ type: 'loopData', id: this.xfer.id, len: 0, sr: SR });
+    this.xfer = null;
+    const lp = this.lp;
+    if (lp.len <= 0 || lp.st === L_REC || this.loading) { this.port.postMessage({ type: 'loopData', id, len: 0, sr: SR }); return; }
+    this.xfer = { id, len: lp.len, pos: 0, gen: this.loopGen };
+  }
+  pumpLoopExport() {
+    const x = this.xfer, lp = this.lp;
+    if (!x) return;
+    if (x.gen !== this.loopGen || lp.len !== x.len) { // Loop hat sich währenddessen geändert
+      this.port.postMessage({ type: 'loopData', id: x.id, len: 0, sr: SR });
+      this.xfer = null;
+      return;
     }
-    this.port.postMessage({ type: 'loopData', id, L, R, sr: SR }, [L.buffer, R.buffer]);
+    if (this.dubSweep) return; // erst die verworfene Overdub-Ebene fertig leeren
+    const a = x.pos, b = Math.min(x.len, a + XFER_CHUNK), n = b - a;
+    const L = new Float32Array(n), R = new Float32Array(n);
+    const bL = this.lbL, bR = this.lbR;
+    if (lp.hasDub && lp.dubOn) {
+      const dL = this.ldL, dR = this.ldR;
+      for (let j = 0; j < n; j++) { L[j] = bL[a + j] + dL[a + j]; R[j] = bR[a + j] + dR[a + j]; }
+    } else { L.set(bL.subarray(a, b)); R.set(bR.subarray(a, b)); }
+    this.port.postMessage({ type: 'loopChunk', id: x.id, off: a, L, R }, [L.buffer, R.buffer]);
+    x.pos = b;
+    if (b >= x.len) { this.port.postMessage({ type: 'loopData', id: x.id, len: x.len, sr: SR }); this.xfer = null; }
   }
   renderLoop(n) {
     const lp = this.lp, oL = this.lpL, oR = this.lpR, pos = this.lpPos;
-    const playing = lp.st === L_PLAY || lp.st === L_DUB;
-    if (!playing || lp.len <= 0) { oL.fill(0, 0, n); oR.fill(0, 0, n); pos.fill(-1, 0, n); return; }
-    const len = lp.len, bL = this.lbL, bR = this.lbR, dL = this.ldL, dR = this.ldR;
-    const useDub = lp.hasDub && lp.dubOn;
-    const fadeInc = 1 / (lp.fadeSec * SR);
-    const dir = lp.rev ? -1 : 1;
-    for (let i = 0; i < n; i++) {
-      lp.speed += (lp.speedT - lp.speed) * 0.0006;
-      let p = lp.pos;
-      const i0 = p | 0, f = p - i0, i1 = i0 + 1 >= len ? 0 : i0 + 1;
-      let sL = bL[i0] + (bL[i1] - bL[i0]) * f;
-      let sR = bR[i0] + (bR[i1] - bR[i0]) * f;
-      if (useDub) { sL += dL[i0] + (dL[i1] - dL[i0]) * f; sR += dR[i0] + (dR[i1] - dR[i0]) * f; }
-      pos[i] = i0;
-      p += lp.speed * dir;
-      if (p >= len) p -= len; else if (p < 0) p += len;
-      lp.pos = p;
-      if (lp.fade !== lp.fadeT) {
-        if (lp.fade < lp.fadeT) lp.fade = Math.min(lp.fadeT, lp.fade + fadeInc);
-        else lp.fade = Math.max(lp.fadeT, lp.fade - fadeInc);
+    const playing = (lp.st === L_PLAY || lp.st === L_DUB) && lp.len > 0;
+    if (!playing) { oL.fill(0, 0, n); oR.fill(0, 0, n); pos.fill(-1, 0, n); }
+    else {
+      const len = lp.len, bL = this.lbL, bR = this.lbR, dL = this.ldL, dR = this.ldR;
+      // Overdub-Ebene weich zu-/abschalten (Undo/Redo), solange sie geleert wird stumm
+      const dubT = lp.hasDub && lp.dubOn && !this.dubSweep ? 1 : 0;
+      const dInc = 1 / DECLICK;
+      let dg = lp.dubG;
+      const fadeInc = lp.fadeFast ? 1 / DECLICK : 1 / (lp.fadeSec * SR);
+      const dir = lp.rev ? -1 : 1;
+      for (let i = 0; i < n; i++) {
+        lp.speed += (lp.speedT - lp.speed) * 0.0006;
+        let p = lp.pos;
+        const i0 = p | 0, f = p - i0, i1 = i0 + 1 >= len ? 0 : i0 + 1;
+        let sL = bL[i0] + (bL[i1] - bL[i0]) * f;
+        let sR = bR[i0] + (bR[i1] - bR[i0]) * f;
+        if (dg !== dubT) dg = dubT > dg ? Math.min(1, dg + dInc) : Math.max(0, dg - dInc);
+        if (dg > 0) { sL += (dL[i0] + (dL[i1] - dL[i0]) * f) * dg; sR += (dR[i0] + (dR[i1] - dR[i0]) * f) * dg; }
+        pos[i] = i0;
+        p += lp.speed * dir;
+        if (p >= len) p -= len; else if (p < 0) p += len;
+        lp.pos = p;
+        if (lp.fade !== lp.fadeT) {
+          if (lp.fade < lp.fadeT) lp.fade = Math.min(lp.fadeT, lp.fade + fadeInc);
+          else lp.fade = Math.max(lp.fadeT, lp.fade - fadeInc);
+        }
+        oL[i] = sL * lp.fade; oR[i] = sR * lp.fade;
+        if (lp.stopping && lp.fade <= 0) {
+          lp.stopping = false; lp.st = L_STOP;
+          for (let k = i + 1; k < n; k++) { oL[k] = 0; oR[k] = 0; pos[k] = -1; }
+          break;
+        }
       }
-      oL[i] = sL * lp.fade; oR[i] = sR * lp.fade;
-      if (lp.stopping && lp.fade <= 0) {
-        lp.stopping = false; lp.st = L_STOP;
-        for (let k = i + 1; k < n; k++) { oL[k] = 0; oR[k] = 0; pos[k] = -1; }
-        break;
-      }
+      lp.dubG = dg;
     }
+    if (this.tail.n > 0) this.renderTail(n);
   }
   loopWrite(i, sL, sR) {
     const lp = this.lp;
     if (lp.st === L_REC) {
-      this.lbL[lp.rec] = sL; this.lbR[lp.rec] = sR; lp.rec++;
+      const r = lp.rec;
+      this.lbL[r] = sL; this.lbR[r] = sR;
+      this.ldL[r] = 0; this.ldR[r] = 0; // Overdub-Ebene gleich mitleeren
+      lp.rec = r + 1;
       if (lp.rec >= LOOP_MAX) this.loopCloseRec(L_PLAY);
     } else if (lp.st === L_DUB) {
       const j = this.lpPos[i];
@@ -525,14 +747,23 @@ class OrbitProcessor extends AudioWorkletProcessor {
 
   /* ---------------- Stimmen ---------------- */
   allocVoice() {
-    let best = null, bestScore = 1e9;
+    let free = null, active = 0, best = null, bestScore = 1e9, fading = null;
     for (let i = 0; i < MAX_VOICES; i++) {
       const v = this.voices[i];
-      if (!v.active) return v;
+      if (!v.active) { if (!free) free = v; continue; }
+      active++;
+      if (v.kill > 0) { if (!fading || v.kill < fading.kill) fading = v; continue; }
       const score = v.amp * v.gain * (v.delay > 0 ? 4 : 1);
       if (score < bestScore) { bestScore = score; best = v; }
     }
-    return best;
+    // Wird es eng, die leiseste Stimme über DECLICK Samples ausblenden statt sie später hart zu übernehmen
+    if (active >= MAX_VOICES - VOICE_RESERVE && best) {
+      if (best.delay > 0) { best.active = false; if (!free) free = best; } // noch nicht hörbar
+      else best.kill = DECLICK;
+    }
+    if (free) return free;
+    // Notfall: alle Stimmen belegt → übernehmen (am liebsten eine, die schon fast ausgeblendet ist)
+    return fading || best || this.voices[0];
   }
   killVoices() { for (const v of this.voices) v.active = false; }
   countVoices() { let c = 0; for (const v of this.voices) if (v.active) c++; return c; }
@@ -554,7 +785,8 @@ class OrbitProcessor extends AudioWorkletProcessor {
     v.seg = v.segCur = seg;
     v.rate = rate; v.dir = rate < 0 ? -1 : 1;
     v.phase = rate < 0 ? seg - 1e-6 : 0;
-    v.dur = Math.max(32, Math.floor(Math.min(dur, 40 * SR)));
+    // nicht länger spielen, als der Abschnitt im Verlaufspuffer überlebt (sonst überschreibt ihn der Schreibkopf)
+    v.dur = Math.max(32, Math.floor(Math.min(dur, 40 * SR, BUF - SR - back - seg - v.delay)));
     v.gain = gain;
     const pa = (clamp(pan, -1, 1) + 1) * Math.PI / 4;
     v.pl = Math.cos(pa); v.pr = Math.sin(pa);
@@ -624,11 +856,11 @@ class OrbitProcessor extends AudioWorkletProcessor {
       let phase = v.phase, t = v.t, amp = v.amp, rate = v.rate, segCur = v.segCur;
       let s1L = v.s1L, s2L = v.s2L, s1R = v.s1R, s2R = v.s2R;
       let a1 = v.a1, a2 = v.a2, a3 = v.a3;
-      let cc = v.crushCnt, chL = v.chL, chR = v.chR;
+      let cc = v.crushCnt, chL = v.chL, chR = v.chR, kill = v.kill;
       const att = v.att, rel = v.rel, perc = v.perc, fin = v.fadeIn, fout = v.fadeOut, dur = v.dur, dec = v.decay;
       const ft = v.ftype, fk = v.fk, cq = v.crushQ, ch = v.crushHold, start = v.start;
       const gL = v.gain * v.pl, gR = v.gain * v.pr;
-      const invAtt = 1 / att, invRel = 1 / rel;
+      const invAtt = 1 / att, invRel = 1 / rel, invKill = 1 / DECLICK;
       let e = 0, done = false;
       for (; i < n; i++) {
         if ((t & 31) === 0) {
@@ -650,6 +882,7 @@ class OrbitProcessor extends AudioWorkletProcessor {
         let f = amp;
         if (t < fin) f *= t / fin;
         const rem = dur - t; if (rem < fout) f *= rem / fout;
+        if (kill > 0) f *= kill * invKill;
         e *= f;
         if (ft) {
           let v3 = sL - s2L, v1 = a1 * s1L + a2 * v3, v2 = s2L + a2 * s1L + a3 * v3;
@@ -664,9 +897,10 @@ class OrbitProcessor extends AudioWorkletProcessor {
         }
         wL[i] += sL * gL * e; wR[i] += sR * gR * e;
         t++;
+        if (kill > 0 && --kill === 0) { done = true; break; }
         if (t >= dur || amp < 1e-4) { done = true; break; }
       }
-      v.phase = phase; v.t = t; v.amp = amp;
+      v.phase = phase; v.t = t; v.amp = amp; v.kill = kill;
       v.s1L = s1L; v.s2L = s2L; v.s1R = s1R; v.s2R = s2R;
       v.crushCnt = cc; v.chL = chL; v.chR = chR;
       v.level = e * v.gain;
@@ -678,7 +912,7 @@ class OrbitProcessor extends AudioWorkletProcessor {
   updateTaps() {
     const fx = this.effect;
     if (fx !== FX.PATTERN && fx !== FX.WARP) {
-      for (const tp of this.taps) tp.on = false;
+      for (const tp of this.taps) { tp.on = false; tp.fbT = 0; }
       this.fbTap = -1; this.fbGain = 0;
       return;
     }
@@ -696,8 +930,9 @@ class OrbitProcessor extends AudioWorkletProcessor {
       const tp = this.taps[k];
       const on = k < N;
       tp.on = on;
+      tp.fbT = k === N - 1 ? 1 : 0; // Rückkopplung kommt vom letzten aktiven Tap (Wechsel wird überblendet)
       if (!on) continue;
-      tp.dT = clamp(pat[k] * U, 32, BUF - SR * 2);
+      tp.dT = clamp(pat[k] * U, TAP_MIN, BUF - SR * 2);
       const x = N > 1 ? k / (N - 1) : 0;
       let c;
       if (S < 0.5) c = lerp(0.2 + 0.8 * x, 1, S / 0.5);
@@ -724,11 +959,14 @@ class OrbitProcessor extends AudioWorkletProcessor {
     const cF = this.cTapFade, cD = this.cTapDel;
     for (let k = 0; k < NUM_TAPS; k++) {
       const tp = this.taps[k];
-      if (!tp.on && tp.fade < 1e-4) { tp.fade = 0; tp.level = 0; continue; }
-      const isFb = k === this.fbTap;
+      if (!tp.on && tp.fade < 1e-4) { tp.fade = 0; tp.level = 0; tp.fbW = tp.fbT; continue; }
+      const onT = tp.on ? 1 : 0;
       let lev = 0;
       for (let i = 0; i < n; i++) {
-        tp.fade += ((tp.on ? 1 : 0) - tp.fade) * cF;
+        tp.fade += (onT - tp.fade) * cF;
+        tp.gS += (tp.gain - tp.gS) * cF;
+        tp.plS += (tp.pl - tp.plS) * cF; tp.prS += (tp.pr - tp.prS) * cF;
+        tp.fbW += (tp.fbT - tp.fbW) * cF;
         tp.d += (tp.dT - tp.d) * cD;
         const base = (base0 + i) & MASK;
         let sL, sR;
@@ -767,9 +1005,10 @@ class OrbitProcessor extends AudioWorkletProcessor {
           tp.s1R = 2 * w1 - tp.s1R; tp.s2R = 2 * w2 - tp.s2R;
           if (tp.ftype === 1) { sL = v2 * 0.8; sR = w2 * 0.8; } else { sL = v1 * tp.k * 3.4; sR = w1 * tp.k * 3.4; }
         }
-        const g = tp.gain * tp.fade;
-        wL[i] += sL * g * tp.pl; wR[i] += sR * g * tp.pr;
-        if (isFb) { fbL[i] += sL * tp.fade; fbR[i] += sR * tp.fade; }
+        const g = tp.gS * tp.fade;
+        wL[i] += sL * g * tp.plS; wR[i] += sR * g * tp.prS;
+        const fw = tp.fade * tp.fbW;
+        if (fw > 1e-6) { fbL[i] += sL * fw; fbR[i] += sR * fw; }
         const a = Math.abs(sL) * g; if (a > lev) lev = a;
       }
       tp.level = lev;
@@ -1155,6 +1394,10 @@ class OrbitProcessor extends AudioWorkletProcessor {
     const mono = p.mono === 1;
     const inG = this.inGain;
 
+    // Große Speicheroperationen des Loopers stückweise erledigen (nie alles in einem Block)
+    if (this.dubSweep) this.pumpDubSweep();
+    if (this.loading) this.pumpLoopLoad();
+    if (this.xfer) this.pumpLoopExport();
     // Looper-Wiedergabe für diesen Block vorab berechnen
     this.renderLoop(n);
     const loopGT = 1.5 * p.loopLevel * p.loopLevel;
@@ -1162,31 +1405,37 @@ class OrbitProcessor extends AudioWorkletProcessor {
     const trails = p.bypassStyle === 1;
 
     /* ---- Pass 1: Eingang, Verlaufspuffer, Onsets, Scheduler ---- */
-    const hL = this.hL, hR = this.hR, fbL = this.fbL, fbR = this.fbR;
+    const hL = this.hL, hR = this.hR;
     const rawL = this.rawL, rawR = this.rawR, dryL = this.dryL, dryR = this.dryR;
     const lpL = this.lpL, lpR = this.lpR, duckT = this.duckT;
     const blockW = this.w;
     let w = this.w;
     const muteFx = bypassed || lp.only;
+    // PRE-Looper speist den Effekt; bei „Nur Looper“ läuft der Loop schon über den Effektweg (sonst doppelt)
+    const preLoop = lp.pre && !lp.only;
     const perSample = this.effect === FX.HAZE || (this.effect === FX.STRUM && this.variation === 1) || this.effect === FX.BLOCKS;
+    const holdT = this.holdOn ? 1 : 0, hInc = 1 / DECLICK, hxB = this.holdXB;
+    let hx = this.holdX;
     let peakIn = this.peakIn;
     for (let i = 0; i < n; i++) {
       let xL = iL ? iL[i] * inG : 0, xR = iR ? iR[i] * inG : 0;
       if (mono) { const m = (xL + xR) * 0.5; xL = m; xR = m; }
       rawL[i] = xL; rawR[i] = xR;
       const ai = Math.abs(xL) > Math.abs(xR) ? Math.abs(xL) : Math.abs(xR); if (ai > peakIn) peakIn = ai;
-      if (lp.pre) { xL += lpL[i] * loopGT; xR += lpR[i] * loopGT; }
+      if (preLoop) { xL += lpL[i] * loopGT; xR += lpR[i] * loopGT; }
       dryL[i] = xL; dryR[i] = xR;
-      if (this.holdOn) {
-        hL[w] = this.holdL[this.holdPos]; hR[w] = this.holdR[this.holdPos];
+      // Verlaufspuffer: Eingang bzw. Hold-Material, beim Umschalten kurz überblendet.
+      // Das Feedback der Delays kommt erst in Pass 2 hinzu (an derselben Stelle, ohne Blockverzögerung).
+      let hl = muteFx ? 0 : xL, hr = muteFx ? 0 : xR;
+      if (hx !== holdT) hx = holdT > hx ? Math.min(1, hx + hInc) : Math.max(0, hx - hInc);
+      if (hx > 0) {
+        hl += (this.holdL[this.holdPos] - hl) * hx; hr += (this.holdR[this.holdPos] - hr) * hx;
         if (++this.holdPos >= this.holdLen) this.holdPos = 0;
-      } else if (muteFx) {
-        hL[w] = fbL[i]; hR[w] = fbR[i];
-      } else {
-        hL[w] = xL + fbL[i]; hR[w] = xR + fbR[i];
       }
+      hxB[i] = hx;
+      hL[w] = hl; hR[w] = hr;
       // Onset-Erkennung auf dem Effekt-Eingang
-      const m = Math.abs(hL[w] + hR[w]) * 0.5;
+      const m = Math.abs(hl + hr) * 0.5;
       this.envF += (m > this.envF ? this.cEnvAF : this.cEnvRF) * (m - this.envF);
       this.envS += (m > this.envS ? this.cEnvAS : this.cEnvRS) * (m - this.envS);
       this.envSlow += (m - this.envSlow) * 0.00005;
@@ -1207,6 +1456,7 @@ class OrbitProcessor extends AudioWorkletProcessor {
       w = (w + 1) & MASK;
     }
     this.w = w;
+    this.holdX = hx;
     this.peakIn = peakIn;
     // ausstehende Tonhöhen-Schätzungen
     for (const o of this.onsets) if (o.pitchAt && this.clock >= o.pitchAt) { o.pitchAt = 0; o.freq = this.estimatePitch(o); }
@@ -1218,18 +1468,26 @@ class OrbitProcessor extends AudioWorkletProcessor {
     this.renderVoices(n, wetL, wetR);
     if (this.effect === FX.PATTERN || this.effect === FX.WARP || this.taps.some(t => t.fade > 1e-4)) this.renderTaps(n, blockW, wetL, wetR);
 
-    // Feedback für den nächsten Block (Delay-Wiederholungen / Haze-Wolke)
+    // Feedback (Delay-Wiederholungen / Haze-Wolke) direkt an die Stelle dieses Blocks im Verlaufspuffer
+    // schreiben. Früher landete es erst im nächsten Block – jede Wiederholung kam dadurch 128 Samples zu
+    // spät und lief bei hohem Feedback hörbar aus dem Takt. Taps lesen mindestens TAP_MIN > Blockgröße zurück.
     const fbG = this.fbTap >= 0 ? this.fbGain : 0;
     const hazeFbT = this.effect === FX.HAZE ? this.R * 0.62 : 0;
     this.hazeFb += (hazeFbT - this.hazeFb) * 0.05;
-    const nfL = this.fbNL, nfR = this.fbNR;
+    const nfL = this.fbNL, nfR = this.fbNR, cF = this.cTapFade, hazeFb = this.hazeFb;
+    let fbGs = this.fbGs;
     for (let i = 0; i < n; i++) {
-      let fl = nfL[i] * fbG + wetL[i] * this.hazeFb;
-      let fr = nfR[i] * fbG + wetR[i] * this.hazeFb;
+      fbGs += (fbG - fbGs) * cF;
+      const fl = nfL[i] * fbGs + wetL[i] * hazeFb;
+      const fr = nfR[i] * fbGs + wetR[i] * hazeFb;
       this.fbDampL += (fl - this.fbDampL) * 0.5; this.fbDampR += (fr - this.fbDampR) * 0.5;
-      nfL[i] = softClip(this.fbDampL); nfR[i] = softClip(this.fbDampR);
+      const g = 1 - hxB[i]; // Hold ersetzt den Pufferinhalt komplett
+      if (g > 0) {
+        const k = (blockW + i) & MASK;
+        hL[k] += softClip(this.fbDampL) * g; hR[k] += softClip(this.fbDampR) * g;
+      }
     }
-    this.fbL = nfL; this.fbR = nfR; this.fbNL = fbL; this.fbNR = fbR;
+    this.fbGs = fbGs;
 
     /* ---- Pass 3: Modulation, Filter, Mix, Looper, Raum, Bypass ---- */
     const cS = this.cSm * 1;
@@ -1307,7 +1565,8 @@ class OrbitProcessor extends AudioWorkletProcessor {
     }
     sm.duck = duck;
     this.peakL = peakL; this.peakR = peakR;
-    if (bypassed && !trails && this.byN > 0.999) { /* reine Durchleitung */ }
+    // NaN/Inf im Ausgang (z. B. durch ungültige Werte) würde Filter und Hall dauerhaft lahmlegen → abfangen
+    if (!(Number.isFinite(oL[n - 1]) && Number.isFinite(oR[n - 1]))) this.recover(oL, oR, n);
 
     if (++this.postCounter >= this.postEvery) { this.postCounter = 0; this.postState(); }
     return true;
