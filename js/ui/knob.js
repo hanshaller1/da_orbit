@@ -97,8 +97,15 @@ export class Knob {
     d.addEventListener('pointercancel', end);
     d.addEventListener('wheel', (e) => {
       e.preventDefault();
+      // Firefox liefert Zeilen (deltaMode 1) statt Pixel – sonst bewegt sich der Regler dort kaum
+      const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
       const steps = this.stepsFor(this.active);
-      const delta = steps ? Math.sign(-e.deltaY) / steps : -e.deltaY / 1200;
+      let delta;
+      if (steps) { // gerastert: Trackpad-Schübe sammeln, damit ein Wisch nicht alle Stufen überspringt
+        this.wheelAcc = (this.wheelAcc || 0) + dy;
+        if (Math.abs(this.wheelAcc) < 50) return;
+        delta = Math.sign(-this.wheelAcc) / steps; this.wheelAcc = 0;
+      } else delta = -dy / 1200;
       this.set(this.values[this.active.key] + delta);
     }, { passive: false });
     d.addEventListener('dblclick', () => this.set(this.active.def));

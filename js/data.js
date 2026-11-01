@@ -180,3 +180,59 @@ export const BANKS = [
   { name: 'Grün', color: 'var(--bank-green)' },
   { name: 'Blau', color: 'var(--bank-blue)' },
 ];
+
+/* ---------- Prüfung von gespeicherten oder importierten Werten ----------
+ * Presets, Exportdateien und localStorage können alte, kaputte oder fremde Werte enthalten.
+ * Ein effect außerhalb 0–10 ließ früher die Oberfläche und den Audio-Prozessor abstürzen. */
+const PARAM_INT = { timeMode: [0, 1], effect: [0, EFFECTS.length - 1], variation: [0, 3], effRev: [0, 1] };
+const clampNum = (v, a, b) => Math.min(b, Math.max(a, v));
+
+export function sanitizeParams(src) {
+  const out = { ...DEFAULT_PARAMS };
+  if (!src || typeof src !== 'object') return out;
+  for (const k of Object.keys(DEFAULT_PARAMS)) {
+    let v = src[k];
+    if (typeof v === 'boolean') v = v ? 1 : 0;
+    if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+    const r = PARAM_INT[k];
+    out[k] = r ? clampNum(Math.round(v), r[0], r[1]) : clampNum(v, 0, 1);
+  }
+  return out;
+}
+
+export function sanitizeLooperOpts(src) {
+  const out = { pre: false, quant: false, only: false, burst: false };
+  if (src && typeof src === 'object') for (const k of Object.keys(out)) if (k in src) out[k] = !!src[k];
+  return out;
+}
+
+export function sanitizePreset(p) {
+  if (!p || typeof p !== 'object') return null;
+  const params = sanitizeParams(p.params);
+  const name = typeof p.name === 'string' && p.name.trim()
+    ? p.name.trim().slice(0, 24)
+    : `${EFFECTS[params.effect].name.slice(0, 5)} ${'ABCD'[params.variation]}`;
+  return {
+    name, params, looperOpts: sanitizeLooperOpts(p.looperOpts),
+    hasLoop: !!p.hasLoop, savedAt: Number.isFinite(p.savedAt) ? p.savedAt : 0,
+  };
+}
+
+export const EXP_TARGETS = ['activity', 'repeats', 'shape', 'filter', 'mix', 'space', 'loopLevel'];
+const GLOBAL_RANGE = {
+  mono: [0, 1], fadeShape: [0, 3], midiChannel: [0, 16], midiClock: [0, 1], inputLine: [0, 1],
+  holdMode: [0, 1], bypassStyle: [0, 2], looperOrder: [0, 1], suggest: [0, 1], expCC: [1, 127],
+};
+/** Ungültige Einträge fallen auf base zurück (beim Laden die Standardwerte, beim Ändern der bisherige Wert). */
+export function sanitizeGlobal(src, base = DEFAULT_GLOBAL) {
+  const out = { ...DEFAULT_GLOBAL, ...base };
+  if (!src || typeof src !== 'object') return out;
+  for (const [k, [a, b]] of Object.entries(GLOBAL_RANGE)) {
+    const raw = src[k];
+    if (raw === undefined || raw === null || raw === '') continue;
+    const v = Number(raw);
+    if (Number.isFinite(v)) out[k] = clampNum(Math.round(v), a, b);
+  }
+  if (EXP_TARGETS.includes(src.expTarget)) out.expTarget = src.expTarget;
+  return out;
+}

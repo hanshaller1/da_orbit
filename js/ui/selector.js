@@ -67,9 +67,14 @@ export class Selector {
     center.addEventListener('click', () => { this.setRev(!this.rev); this.onRev(this.rev); });
     wrap.appendChild(center);
     this.center = center;
+    // Mausrad blättert; Trackpads liefern viele kleine Ereignisse → aufsummieren (sonst rast ein Wisch durch alle 44)
+    this.wheelAcc = 0;
     wrap.addEventListener('wheel', (e) => {
       e.preventDefault();
-      this.step(e.deltaY > 0 ? 1 : -1);
+      this.wheelAcc += e.deltaMode === 1 ? e.deltaY * 33 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
+      if (Math.abs(this.wheelAcc) < 60) return;
+      this.step(this.wheelAcc > 0 ? 1 : -1);
+      this.wheelAcc = 0;
     }, { passive: false });
     host.appendChild(wrap);
     this.render();
